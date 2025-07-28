@@ -1,0 +1,97 @@
+**1. Introduction**
+
+- Genetic variation is essential for the evolution of populations and the breeding of animals and plants.
+- Traits controlled by a single gene are called qualitative traits.
+- Traits influenced by many genes and affected by environmental factors are called quantitative traits.
+- Most economically important traits are quantitative.
+- These traits exhibit continuous variation and are described by mean, variance, and other statistical parameters.
+- Analysis of such traits requires statistical methods and quantitative genetics theory.
+
+**2. Heritability**
+
+- Heritability is the proportion of the total phenotypic variation that is due to genetic variation.
+- Heritability is divided into two types: broad-sense and narrow-sense heritability.
+- Broad-sense heritability } $H^2 = \frac{V_G}{V_P}$
+- Narrow-sense heritability $h^2 = \frac{V_A}{V_P}$
+- $V_G$: total genetic variance; $V_A$: additive genetic variance; $V_P$: phenotypic variance.
+- Heritability is population-specific and environment-specific.
+- High heritability means selection can be effective.
+- Low heritability implies a large environmental effect and selection is less efficient.
+
+**3. Genetic variance**
+
+- The phenotypic variance $V_P$is composed of genetic and environmental components.
+- $V_P = V_G + V_E$
+- $V_G$can be divided into:
+    - $V_A$: additive genetic variance
+    - $V_D$ : dominance genetic variance
+    - $V_I$: interaction or epistatic variance
+- Additive variance  $V_A$ is the most important component for selection.
+- Dominance and epistatic variances are more important in crossbreeding and hybrid vigour.
+
+**4. Response to selection**
+
+- The response to selection depends on heritability and selection differential.
+- The breeder’s equation: $R = h^2 \times S$
+- RR: response to selection;  $h^2$: heritability; $S$: selection differential.
+- Selection differential SS: the difference between the mean of selected individuals and the population mean.
+- Higher heritability leads to greater response.
+- The genetic gain can be increased by:
+    - increasing heritability
+    - increasing selection intensity
+    - reducing generation interval
+    - improving accuracy of selection
+
+**5. Genetic correlation**
+
+- Genetic correlation is the correlation between breeding values for two traits.
+- Genetic correlation arises due to pleiotropy or linkage disequilibrium.
+- A positive genetic correlation indicates that selection for one trait will also improve the other.
+- A negative correlation means that improvement in one trait may lead to deterioration of the other.
+- Knowledge of genetic correlations is important for multi-trait selection.
+
+**6. Genotype × environment interaction**
+
+- G × E interaction occurs when different genotypes perform differently in different environments.
+- It can reduce the accuracy of selection and genetic gain.
+- It is important to test genotypes in multiple environments.
+- Statistical models can partition the variance due to genotype, environment, and their interaction.
+- Selection should consider the stability of performance across environments.
+
+**7. Quantitative trait loci (QTL)**
+
+- QTL are genomic regions that control quantitative traits.
+- QTL can be identified using molecular markers and statistical methods.
+- QTL mapping requires a segregating population, genetic markers, and phenotypic data.
+- The basic idea is to test the association between marker genotypes and trait values.
+- If the marker is close to a gene affecting the trait, the marker genotype will be associated with the trait value.
+- QTL analysis provides information on the number, position, and effect of loci.
+
+**8. Marker-assisted selection (MAS)**
+
+- MAS uses DNA markers linked to QTL to select individuals.
+- It allows early and accurate selection, especially for traits with low heritability.
+- MAS can be used for:
+    - introgression of QTL
+    - gene pyramiding
+    - background selection
+    - reducing phenotyping cost
+- MAS is effective when markers are tightly linked to the trait.
+- It complements but does not replace conventional breeding.
+
+**9. Genomic selection**
+
+- Genomic selection uses genome-wide markers to predict the genetic value of individuals.
+- It includes all marker effects in a prediction model without identifying individual QTL.
+- Genomic estimated breeding values (GEBVs) are calculated and used for selection.
+- It is especially useful for complex traits and large-scale breeding programs.
+- Genomic selection increases selection accuracy and accelerates genetic gain.
+
+**10. Summary**
+
+- Quantitative traits are controlled by many genes and influenced by the environment.
+- Heritability is key to determining selection response.
+- Genetic variance includes additive, dominance, and epistatic components.
+- Selection response depends on heritability and selection differential.
+- QTL mapping and MAS help identify and use genetic loci for selection.
+- Genomic selection uses genome-wide data for more efficient breeding.
