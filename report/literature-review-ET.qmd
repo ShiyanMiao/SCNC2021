@@ -1,0 +1,40 @@
+---
+title: "Literature Review"
+author: "Shiyan Miao"
+format: beamer
+bibliography: ref.bib
+execute:
+  echo: false
+---
+
+## Introduction 
+
+Hi!
+
+## What is QTL?
+
+
+I am using @rstats to do my analysis.
+
+I am also using @tidyverse to do a lot of my data analysis.
+
+@fig-plot demonstrates my usage of `ggplot2` package.
+
+
+```{r}
+#| label: fig-plot
+#| message: false
+#| fig-cap: This is my first scatter plot.
+library(tidyverse)
+ggplot(cars, aes(dist, speed)) +
+  geom_point()
+```
+
+
+
+
+
+
+## Reference
+
+
