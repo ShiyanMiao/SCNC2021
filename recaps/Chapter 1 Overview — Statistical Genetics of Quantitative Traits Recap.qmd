@@ -1,0 +1,125 @@
+---
+title: "Chapter 1 Overview — Statistical Genetics of Quantitative Traits"
+format:
+  pptx:
+    slide-level: 2
+execute:
+  enabled: false
+---
+
+## 1. Quantitative Traits and Genetic Background
+
+-   Quantitative traits are determined by multiple genes and environmental factors.
+-   Unlike qualitative traits controlled by single genes, quantitative traits require statistical analysis.
+
+**Phenotypic model**
+
+$$
+P = G + E
+$$
+
+**Genotypic decomposition**
+
+$$
+G = A + D + I
+$$
+
+-   (A): additive; (D): dominance; (I): epistatic
+
+------------------------------------------------------------------------
+
+## 2. Purpose of QTL Analysis
+
+-   QTLs: genes or genomic regions controlling quantitative trait variation.
+-   Goal: identify markers for MAS.
+
+**Statistical test**
+
+$$
+H_0:\ \alpha = 0 \quad \text{vs} \quad H_1:\ \alpha \neq 0
+$$
+
+------------------------------------------------------------------------
+
+## 3. Basic Principles of QTL Mapping
+
+-   Genotype and phenotype individuals; analyze marker–trait associations.
+
+**Linkage effect**
+
+For recombination rate (r): $$
+\alpha_M = a(1 - 2r)
+$$
+
+**Single-marker linear model**
+
+$$
+y = \mu + \alpha_M + \delta_M + \varepsilon
+$$
+
+-   (\alpha\_M): marker additive effect; (\delta\_M): dominance; (\varepsilon): residual
+
+------------------------------------------------------------------------
+
+## 4. Mapping Populations
+
+**F2 population**
+
+$$
+P(q_1q_1) = \frac{1}{4},\quad P(q_1q_2) = \frac{1}{2},\quad P(q_2q_2) = \frac{1}{4}
+$$
+
+**Backcross (BC)**
+
+$$
+P(q_1q_1) = \frac{1}{2},\quad P(q_1q_2) = \frac{1}{2}
+$$
+
+------------------------------------------------------------------------
+
+## 5. Analysis Methods
+
+**SMA (ANOVA)**
+
+$$
+F = \frac{MS_{\mathrm{between}}}{MS_{\mathrm{within}}}
+$$
+
+**Interval mapping (IM)**
+
+$$
+\log L = \sum_{i=1}^{n} \log \left( \sum_{g} P(g \mid M)\, f(y_i \mid g) \right)
+$$
+
+-   CIM: IM with covariates
+-   MQM: multiple QTLs jointly
+
+------------------------------------------------------------------------
+
+## 6. Gene Effects
+
+**Expected means**
+
+$$
+E[y \mid q_1q_1] = \mu + a,\quad
+E[y \mid q_1q_2] = \mu + d,\quad
+E[y \mid q_2q_2] = \mu - a
+$$
+
+------------------------------------------------------------------------
+
+## 7. Bias and Power
+
+**Effect decay**
+
+$$
+\mathrm{Observed\ effect} = a(1 - 2r)
+$$
+
+**Approximate power (LOD)**
+
+$$
+\mathrm{Power} \approx \Phi \left( \frac{\sqrt{n}\, a(1 - 2r)}{\sigma} - z_{\alpha} \right)
+$$
+
+-   Power decreases with small (n), low marker density, complex LD
