@@ -2,9 +2,12 @@
 title: "Literature Review: Selection, QTL Mapping and Statistical Models"
 author: "Shiyan Miao|u8027892"
 date: "2025-09-08"
-format: pdf
+format:
+  pdf:
+    number-sections: true 
 bibliography: reference.bib
 csl: chicago-author-date.csl
+toc: true
 ---
 
 # Definitions and Conceptual Debates
