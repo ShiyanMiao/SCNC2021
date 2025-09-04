@@ -19,7 +19,9 @@ toc: true
 
 # Introduction
 
-Emi's comment. Talk about how your introduction is arranged. 
+Selective breeding has long been the cornerstone of agricultural improvement, enabling the development of crop varieties and livestock breeds with enhanced productivity, resilience, and quality traits to meet the growing global demand for food [@falconer1996; @godfray2010]. However, traditional approaches such as phenotypic selection, progeny testing, and backcrossing are inherently slow and resource-intensive. They rely heavily on the expression of observable traits, which are often influenced by environmental variation, and thus provide only an indirect and delayed measure of the underlying genetic potential [@collard2005]. 
+
+Marker-assisted selection (MAS) emerged as a transformative strategy to accelerate the breeding process by integrating molecular markers into selection decisions. Because DNA markers are not affected by environmental factors and can be assayed at early developmental stages, MAS allows breeders to identify and retain individuals carrying favorable alleles long before the phenotype is expressed [@collard2005; @hasan2021]. Importantly, the success of MAS depends on the prior identification of molecular markers that are tightly linked to quantitative trait loci (QTLs), the genomic regions underlying phenotypic variation in complex traits [@mackay2009]. Establishing these marker–trait associations is therefore a critical step in harnessing MAS for crop and livestock improvement.
 
 ## Selection in Biology
 
@@ -45,33 +47,58 @@ Marker-assisted selection (MAS) represents a methodological advance that address
 
 **QTL Data Structure** In practice, QTL analyses are based on a structured dataset comprising marker genotypes and quantitative phenotypes. Genotypes are typically coded numerically (e.g., 0 = homozygous for one allele, 1 = homozygous for the alternative allele), allowing direct statistical modelling of their association with phenotypic values [@mackay2009, p. 565]. Because of financial and technological constraints, whole-genome sequencing is not always feasible, and QTL are often inferred from linkage disequilibrium between genotyped markers and unobserved causal loci [@collard2005, pp. 171–172].
 
-**Linkage and Recombination**  The principle of linkage is central to QTL mapping. Two loci located on the same chromosome are said to be linked when they are inherited together more frequently than expected under independent assortment. Recombination frequency (\( r \)) quantifies the likelihood of crossover events between loci: \( r = 0 \) indicates complete linkage (no recombination), while \( r = 0.5 \) corresponds to independent segregation [@falconer1996, p. 60]. In practice, tightly linked markers serve as proxies for nearby QTL, as recombination events between them are rare, thereby allowing geneticists to map phenotypic variation to specific chromosomal regions [@mackay2009, p. 566].
+**Linkage and Recombination**  The principle of linkage is central to QTL mapping. Two loci located on the same chromosome are said to be linked when they are inherited together more frequently than expected under independent assortment. Recombination frequency \( r \) quantifies the likelihood of crossover events between loci: \( r = 0 \) indicates complete linkage (no recombination), while \( r = 0.5 \) corresponds to independent segregation [@falconer1996, p. 60]. In practice, tightly linked markers serve as proxies for nearby QTL, as recombination events between them are rare, thereby allowing geneticists to map phenotypic variation to specific chromosomal regions [@mackay2009, p. 566].
 
 # Method
 
-Talk about how method is arranged. 
+The detection of quantitative trait loci (QTL) fundamentally relies on the development and application of appropriate statistical models. These models provide a framework to relate marker genotypes to phenotypic variation and to identify genomic regions that contribute to quantitative traits. We begin by examining the statistical foundations of QTL detection, focusing first on the single-marker model. In the context of a backcross population, this model allows us to evaluate the recombination frequency between a marker and a putative QTL, to express the relationship as a univariate regression, and to extend inference through mixture distribution approaches that accommodate uncertainty in underlying genotypes. 
+
+Building on this, we then turn to the multiple marker model, which generalises single-locus regression to incorporate multiple loci simultaneously. This formulation enhances power and reduces spurious associations but also introduces challenges related to multicollinearity and high-dimensionality. To address these issues, three principal strategies of model selection are considered. The first is **stepwise selection**, which employs criteria such as the AIC and BIC to iteratively identify an optimal subset of markers. The second is **Bayesian shrinkage**, in which hierarchical priors induce marker-specific shrinkage, enabling adaptive sparsity and improved estimation. The third is **penalised selection**, which encompasses ridge regression, the least absolute shrinkage and selection operator (LASSO), and the elastic net. These approaches introduce regularisation penalties that mitigate overfitting, stabilise estimation in the presence of linkage disequilibrium, and achieve a balance between variable selection and grouping effects. 
+
+Together, these models and strategies form the methodological basis for contemporary QTL mapping and marker-assisted selection.
+
 
 ## Statistical Models for Detecting QTL
 
-Emi's comment (connection between statistical model and QTL)
+Statistical models are central to quantitative trait locus (QTL) analysis, providing the formal link between observed phenotypic variation and underlying genetic architecture. A QTL is defined as a chromosomal region containing one or more loci that contribute to variation in a quantitative trait [@mackay2009]. Because QTLs cannot be observed directly, their presence and effects must be inferred statistically by evaluating associations between genetic markers and phenotypic outcomes in a mapping population. Statistical models provide the framework for this inference by decomposing the phenotype into systematic components attributable to genetic and environmental factors and by quantifying the extent to which marker genotypes predict trait values [@falconer1996].
 
-The phenotype can be decomposed as:
+At their core, these models specify the relationship between a phenotypic response variable and explanatory variables that represent marker genotypes. 
+$$
+y_i = x_i + z_i + x_i \times z_i + \epsilon_i,
+$$
+
+where $y_i$ is the phenotype of the $i$-th individual, $x_i$ the genetic effect, $z_i$ the environmental effect, and $\epsilon_i$ the residual error. For the purposes of this study, the model is simplified to focus exclusively on the genetic contribution to phenotypic variation:
 
 $$
-P = G + E + G \times E + \text{residual}
-$$
-
-A simplified version is:
-
-$$
-P = G + \text{residual}
+y_i = x_i + \epsilon_i.
 $$
 [@falconer1996, pp. 111–112].
+
+The underlying assumption of this simplification is that environmental effects and their interactions with genotype are negligible. Accordingly, the analysis considers only the phenotypic variance attributable to genetic effects, with the residual term capturing unexplained variation.
+
 
 ## Single Marker Model
 
 ### Backcross population
 
+Backcross (BC) populations are generated by crossing an F₁ hybrid back to one of its parental lines. In the illustrated scheme, an individual homozygous for allele A (blue, with a star marker) is crossed with an individual homozygous for allele C (orange, with a star marker). The F₁ generation inherits one allele from each parent and is then crossed again with the recurrent parent carrying allele C.
+
+![](Figure%201.png){#fig-1 fig-cap="Figure 1. Backcross scheme showing recombination frequency" fig-align="center" width=70%}
+
+
+As shown in the figure, recombination between the marker locus and the putative QTL occurs with probability $c$, the recombination fraction. The resulting BC₁ progeny segregate into four possible genotypes:
+
+With probability $\tfrac{1}{2}(1-c)$, the offspring inherit the non-recombinant haplotype associated with genotypic value $d$.
+
+With probability $\tfrac{1}{2}(1-c)$, they inherit the alternate non-recombinant haplotype with genotypic value $a$.
+
+With probability $\tfrac{1}{2}c$, recombination produces a haplotype with genotypic value $a$.
+
+With probability $\tfrac{1}{2}c$, recombination produces a haplotype with genotypic value $d$.
+
+Thus, the figure illustrates how the distribution of progeny genotypes in a backcross depends on recombination between the marker and QTL. When $c=0$, the marker and QTL are perfectly linked, and segregation follows the expected 1:1 ratio of parental haplotypes. When $c=0.5$, the marker and QTL assort independently, and no linkage information can be extracted.
+
+In statistical terms, the backcross design is particularly powerful because it simplifies the genetic background: only two marker classes are present (AC vs CC). This makes it possible to test the association between marker genotype and phenotype using a univariate regression or a t-test, providing a straightforward framework for detecting linkage between markers and QTL.
 
 ### Recombination Frequency
 
@@ -161,6 +188,9 @@ $$
 
 The overall phenotypic distribution is therefore a two-component normal mixture [@wu2007, pp. 204–210; @foster2006, p. 15].
 
+The symbol $z$ denotes the observed value of the variable, which in QTL analysis can be understood as an individual’s measured phenotype (e.g., plant height or yield). The symbol $\mu$ represents the mean of the distribution, corresponding to the expected phenotype or genotypic value for a given marker genotype. The symbol $\sigma^2$ indicates the variance of the distribution, capturing the spread of observations around the mean; in QTL models it reflects residual variation not explained by genotype, such as environmental influences or measurement error.
+
+
 ## Multiple Marker Model
 
 In contrast to single-marker analysis, which tests one locus at a time, the multiple marker model simultaneously incorporates information from several markers across the genome into a linear regression framework. This approach improves statistical power by accounting for background loci and reduces spurious associations that may arise when only one marker is analysed in isolation.
@@ -168,24 +198,25 @@ In contrast to single-marker analysis, which tests one locus at a time, the mult
 Formally, the model can be expressed as:
 
 $$
-y_i = \mu + \sum_{j=1}^{m} \beta_j x_{ij} + \epsilon_i,
+y_i = \mu + \sum_{j=1}^{m} \beta_j G_{ij} + \epsilon_i,
 $$
 
 where  
 
 - $y_i$ is the phenotypic value of the $i$-th individual,  
-- $x_{ij}$ denotes the coded genotype of the $j$-th marker for the $i$-th individual (for example, 0/1 coding for backcross populations; 0/1/2 coding for F$_2$ populations),  
+- $G_{ij}$ denotes the coded genotype of the $j$-th marker for the $i$-th individual (for example, 0/1 coding for backcross populations; 0/1/2 coding for F$_2$ populations),  
 - $\beta_j$ represents the partial regression coefficient, capturing the effect of marker $j$ conditional on the presence of other markers in the model,  
 - $\mu$ is the overall mean, and  
 - $\epsilon_i \sim \mathcal{N}(0, \sigma^2)$ denotes the residual error term, assumed to follow an independent and identically distributed normal distribution.  
 
-Classical approaches in multiple marker model include **stepwise regression** and model selection based on information criteria such as the Akaike Information Criterion (AIC) and the Bayesian Information Criterion (BIC). More recently, **penalised regression methods** have become widely adopted. Ridge regression applies an $\ell_2$ penalty to shrink coefficients and stabilise estimates in the presence of multicollinearity, while the least absolute shrinkage and selection operator (LASSO) employs an $\ell_1$ penalty that simultaneously performs variable selection and regularisation. The elastic net combines both penalties, offering a compromise between selection and stability, which is particularly advantageous in high-dimensional settings where markers are highly correlated.
+Classical approaches in multiple marker model include **stepwise regression** and model selection based on information criteria such as the Akaike Information Criterion (AIC) and the Bayesian Information Criterion (BIC). More recently, **penalised regression methods** have become widely adopted. Ridge regression applies an $\ell_2$ penalty to shrink coefficients and stabilize estimates in the presence of multicollinearity [@ogutu2012], while the least absolute shrinkage and selection operator (LASSO) employs an $\ell_1$ penalty that simultaneously performs variable selection and regularization [@li2012]. The elastic net combines both penalties, offering a compromise between selection and stability, which is particularly advantageous in high-dimensional settings where markers are highly correlated [@zou2005; @brault2021].
+
 
 we will introduce each of these methods in details for the rest of the section. 
 
 ### Stepwise Selection
 
-A classical approach to variable selection is stepwise regression, in which markers are iteratively added or removed from the model according to predefined criteria. In practice, the Akaike Information Criterion (AIC) and Bayesian Information Criterion (BIC) are widely used to select the model that minimises information loss:
+A classical approach to variable selection is stepwise regression, in which markers are iteratively added or removed from the model according to predefined criteria. In practice, the AIC and BIC are widely used to select the model that minimises information loss:
 
 $$
 \text{AIC} = -2 \log L + 2k, \qquad 
@@ -226,6 +257,7 @@ $$
 + \lambda_2 \|\boldsymbol{\beta}\|_2^2
 \right\}.
 $$
+In penalised regression frameworks for QTL mapping, two hyperparameters, $\lambda_1$ and $\lambda_2$, govern the strength of regularisation. Specifically, $\lambda_1$ controls the $\ell_1$ penalty that induces sparsity by shrinking some coefficients exactly to zero, while $\lambda_2$ controls the $\ell_2$ penalty that shrinks coefficients toward zero without eliminating them. 
 
 - **Ridge regression** ($\lambda_2>0, \lambda_1=0$): shrinks all coefficients toward zero but not exactly to zero. It stabilises estimates under strong multicollinearity, especially when markers are in linkage disequilibrium (LD). However, ridge does not perform variable selection.  
 
@@ -237,12 +269,10 @@ In summary, stepwise selection, Bayesian shrinkage, and penalised regression rep
 
 # Discussion and Summary
 
-This review highlights the evolution of selection methods from phenotype-based strategies to MAS and advanced statistical models for QTL detection. Traditional approaches, while foundational, are limited by environmental noise, time costs, and low heritability traits. MAS represents a breakthrough, linking phenotype to genotype and enabling earlier, more precise selection.
+This review has outlined the development of breeding approaches from traditional phenotype-based selection to marker-assisted selection (MAS) and, more recently, statistical models for QTL detection. While these advances have accelerated breeding efficiency, important challenges remain. First, QTL often map to broad genomic regions rather than specific genes, which restricts biological interpretation. Second, the statistical power to detect loci is reduced when traits are of low heritability or when marker density is insufficient to capture genetic variation. Third, QTL studies are almost always performed with finite sample sizes, and small experimental populations in particular limit both discovery and reproducibility. Although high-density genotyping and sequencing costs can still present barriers, these technological constraints are increasingly secondary compared to the statistical limitations.
 
-QTL mapping, supported by models such as interval mapping and LASSO-based approaches, provides a framework for identifying loci contributing to quantitative traits. However, significant gaps remain:  
-- **Resolution**: Most QTL map to broad genomic regions rather than specific genes.  
-- **Effect size**: Many QTL explain only small fractions of trait variation, raising the “missing heritability” problem.  
-- **Technological challenges**: High-density genotyping and sequencing are still costly and computationally demanding.
+Looking forward, future research should focus on advancing statistical methodology. One promising direction is the extension of multiple marker models to incorporate mixture distributions, which would allow more flexible modelling of heterogeneous genetic effects across loci. Another priority is to establish guidelines for minimum effective sample sizes that ensure robust QTL detection under different genetic architectures. Together, these efforts could significantly improve the resolution and reliability of QTL mapping, ultimately strengthening the role of statistical methods in modern breeding programmes.
+
 
 ## Single marker model vs. multiple marker model
 
@@ -253,9 +283,11 @@ In summary, the multiple marker model represents a natural extension of single m
 Although the multiple marker model offers conceptual and practical advantages, it also introduces new statistical challenges. One important issue is **multicollinearity** among markers, which arises because markers in close physical proximity are often in linkage disequilibrium. This correlation can inflate the variances of the estimated regression coefficients, thereby reducing interpretability and statistical reliability. Furthermore, in modern genomic studies the number of markers ($p$) frequently exceeds the number of individuals ($n$), rendering ordinary least squares estimation unstable or infeasible. Aside from multicollinearity, overfitting, and instability in high-dimensional settings where the number of markers greatly exceeds the number of samples are also potneial issue for multiple marker model [@foster2006; @wu2007].. 
 
 ## Model choice
-Suggestion. 1. single or multiple. 2. multiple, which stratage. 
+
+When only a few QTL with moderate to large effects are expected, particularly in a backcross design requiring rapid screening, the single-marker model provides an efficient and appropriate approach. By contrast, when the genetic architecture involves many loci with small to medium effects, a multiple marker model is more suitable, as it enables the estimation of conditional effects while accounting for the influence of other loci. To further enhance the performance of multiple marker models, penalised regression strategies can be incorporated. In particular, the elastic net offers a balanced framework that combines the sparsity of $\ell_1$ regularisation with the grouping effect of $\ell_2$ penalties. This dual property allows for more stable selection of correlated markers while simultaneously mitigating overfitting through shrinkage.
 
 ## Future work
-Future work should focus on integrating **systems genetics approaches** that combine QTL mapping with transcriptomics and other molecular phenotypes [@mackay2009], and on improving **statistical models** that can handle high-dimensional, correlated data. Marker-assisted and genomic selection, supported by robust statistical inference, promise to enhance the precision of breeding and deepen our understanding of complex trait architecture.
+
+Looking forward, future research should focus on advancing statistical methodology. One promising direction is the extension of multiple marker models to incorporate mixture distributions, which would allow more flexible modelling of heterogeneous genetic effects across loci. Another priority is to establish guidelines for minimum effective sample sizes that ensure robust QTL detection under different genetic architectures. Together, these efforts could significantly improve the resolution and reliability of QTL mapping, ultimately strengthening the role of statistical methods in modern breeding programmes.
 
 # Reference
