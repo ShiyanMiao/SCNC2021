@@ -9,7 +9,7 @@ format:
       text: |
         \usepackage{setspace}
         \doublespacing
-        \usepackage[left,pagewise]{lineno}
+        \usepackage[left]{lineno}
         \linenumbers
         \usepackage[margin=1in]{geometry}
 bibliography: reference.bib
