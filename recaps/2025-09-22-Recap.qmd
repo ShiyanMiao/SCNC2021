@@ -1,0 +1,127 @@
+---
+title: "Simulation-based Framework for QTL Experimental Design"
+format: pptx
+---
+
+## 1. Data Input and Population Structure
+
+-   Upload or generate a genotype matrix (0/1/2 additive coding).
+-   Quickly view number of individuals, markers, allele frequency distribution.
+-   Interface calculates **MAF distribution** and low-diversity marker proportion.
+-   Warns when population is too homogeneous → reduced statistical power risk.
+
+What is MAF？
+
+-   **MAF (Minor Allele Frequency)** is the frequency of the less common allele at a locus.
+-   The **MAF distribution** is the distribution of these frequencies across all markers.
+-   If many loci have MAF close to 0 (e.g., \<0.05), the markers are nearly fixed, reducing power to detect QTL. Hence, low-MAF markers are often filtered before analysis.
+
+------------------------------------------------------------------------
+
+## 2. Model Selection and Multiple Testing Correction
+
+-   Initial implementation: **Single-marker regression (SIM)**.\
+
+-   Reserved extensions: **LMM** and **CIM/IM**.\
+
+-   User specifies significance level $\\alpha$ and correction method:
+
+    -   **Bonferroni:** : divides α by the number of tests M (e.g., 0.05/10,000 = 5e-6). Very strict, controls **family-wise error rate (FWER)**, but overly conservative.\
+
+    -   **FDR(False Discovery Rate)**: controls the expected proportion of false positives among significant results, often using the Benjamini–Hochberg method. Less strict, more suitable for large-scale marker testing.
+
+-   Future iterations:
+
+    -   **Linear Mixed Models (LMMs)** account for population structure and relatedness by including random effects with a **genomic relationship matrix (GRM)** or **principal components (PCs)**.\
+    -   **Ordinal GLMM:** ordered categorical data (e.g., disease severity).
+    -   **Cumulative logit link:**
+
+    $$
+    \log \frac{P(Y \leq k)}{P(Y > k)} = \theta_k - x\beta
+    $$
+
+    -   Captures rank order + random effects.
+
+    ------------------------------------------------------------------------
+
+    ## 
+
+------------------------------------------------------------------------
+
+## 3. Power Analysis: Analytical and Simulation
+
+**Analytical Derivation:**
+
+$$
+\lambda(n)=\frac{n\,\beta^{2}\,2p(1-p)}{\sigma^{2}\bigl(1-R_c^{2}\bigr)},\qquad
+\text{Power}\approx 1 - F_{t,\text{nc}}\!\bigl(t_{1-\alpha/2;\,\nu};\,\nu,\,\lambda\bigr)
+$$
+
+-   Theoretical power curve → **sample size derivation**.
+
+**Simulation Check:**\
+- Simulate phenotypes from genotype data.\
+- Repeat multiple times, record detection of true QTL.\
+- Overlay scatter on analytical curve.
+
+------------------------------------------------------------------------
+
+## 4. dPower/dn: Marginal Gain and Stopping
+
+-   Compute finite differences of power–sample size curve.\
+-   Derive marginal power gain: $d\text{Power}/dn$.\
+-   User sets threshold (e.g., 0.005).\
+-   If $d\text{Power}/dn$ \< threshold → prompt: “Adding samples has little effect.”\
+-   Prevents **oversampling costs**.
+
+------------------------------------------------------------------------
+
+## 5. Sample Size Solver
+
+-   Binary search for minimum $n^*$ achieving target power (e.g., 80%).\
+-   Returns simulation-confirmed actual power.\
+-   Turns formula derivation into an intuitive **solver tool**.\
+-   Provides **clear guidelines**.
+
+------------------------------------------------------------------------
+
+## 6. Cost–Power Optimization
+
+-   Input: genotyping, phenotyping, fixed costs.\
+-   System outputs:
+    -   Max power achievable within budget.
+    -   Unit cost efficiency: $$\Delta \text{Cost}/\Delta \text{Power}$$.
+    -   Warnings for undersampling risk.
+
+→ Balance **scientific power** and **economic efficiency**.
+
+------------------------------------------------------------------------
+
+## 7. Blackleg Case Demonstration
+
+-   Dedicated “Blackleg Case” tab.\
+
+-   Why we add “Blackleg Case” tab？
+
+    Blackleg is a major fungal disease of canola (*Brassica napus*), caused by **Leptosphaeria maculans**. It causes basal stem necrosis, leading to yield losses of 50–90%. Blackleg resistance loci are important QTL targets in breeding.
+
+-   Continuous traits binned into ordered scores (0–K).\
+
+-   Simulates disease severity scoring.\
+
+-   Future: **Cumulative logit GLMM** for realistic power estimation.\
+
+-   Real-world agronomic case study.
+
+------------------------------------------------------------------------
+
+## 8. Report Export and Accessibility
+
+-   Export auto-generated **parameter summary report** (txt; later PDF/HTML).\
+-   Includes:
+    -   Experimental design parameters.\
+    -   Analytical + simulation results.\
+    -   dPower/dn stopping suggestions.\
+    -   Cost–power balance.
+
+Accessible for **statistical researchers** and **applied agronomists**.
