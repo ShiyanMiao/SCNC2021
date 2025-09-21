@@ -1,0 +1,472 @@
+---
+title: "Untitled"
+author: "Shiyan Miao"
+date: "2025-09-08"
+output: html_document
+---
+
+```{r}
+install.packages(c("shiny","shinythemes","data.table","DT","ggplot2","MASS"))
+```
+
+```{r}
+# app.R
+# QTL Design Sandbox (Minimal Shiny Skeleton)
+# -------------------------------------------------------
+# Features:
+# - Data: import/generate genotype, population structure & preprocessing
+# - Model: choose statistical model & threshold, multiple testing correction
+# - Power: analytic (approx) & simulated power, comparison curves
+# - Derivative: dPower/dn (marginal gain) & stopping suggestion
+# - Solver: sample size inversion (target power -> n*)
+# - Optimiser: power–cost frontier, over/under-sampling warnings
+# - Case: Blackleg ordinal scoring (cumulative logit) demo (minimal)
+# - Report: export summary (parameters + plots + suggestions)
+# -------------------------------------------------------
+
+suppressPackageStartupMessages({
+  library(shiny); library(shinythemes)
+  library(data.table); library(DT); library(ggplot2)
+  library(MASS); library(stats); library(glue)
+})
+
+# -----------------------------
+# Utility functions
+# -----------------------------
+
+# Generate a demo genotype matrix (n individuals, m markers; additive coding 0/1/2)
+genotype_sim <- function(n = 400, m = 200, maf = 0.3, seed = 1) {
+  set.seed(seed)
+  # Sum of binomials gives 0/1/2 genotypes
+  G <- matrix(rbinom(n * m, 2, maf), nrow = n, ncol = m)
+  colnames(G) <- paste0("M", seq_len(m))
+  G
+}
+
+# Simulate a continuous (Gaussian) trait from user-specified true QTL and effects
+simulate_trait_gaussian <- function(G, qtl_index, beta, h2 = 0.2, rc2 = 0, seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  n <- nrow(G)
+  # Linear additive true model:
+  g_eff <- as.numeric(G[, qtl_index, drop = FALSE] %*% beta)
+  var_g <- var(g_eff)
+  # Target Var(y) = 1; set residual variance from h2
+  if (var_g < 1e-12) var_g <- 1e-12
+  sigma2_e <- (var_g - h2 * var_g) / h2  # h2 = var_g / (var_g + sigma2_e)
+  if (sigma2_e <= 0) sigma2_e <- 1e-6
+  y <- scale(g_eff + rnorm(n, 0, sqrt(sigma2_e)), center = TRUE, scale = TRUE)[,1]
+  attr(y, "sigma2_e") <- sigma2_e
+  y
+}
+
+# Single-marker regression scan: return p-value per marker
+single_marker_scan <- function(G, y) {
+  nmark <- ncol(G)
+  pvals <- numeric(nmark)
+  for (j in seq_len(nmark)) {
+    fit <- try(suppressWarnings(lm(y ~ G[, j])), silent = TRUE)
+    if (inherits(fit, "try-error")) { pvals[j] <- 1; next }
+    sm <- summary(fit)$coefficients
+    pvals[j] <- if (nrow(sm) >= 2) sm[2, 4] else 1
+  }
+  pvals
+}
+
+# Genome-wide alpha (Bonferroni/FDR simplified)
+effective_alpha <- function(alpha, M, method = c("bonferroni","fdr")) {
+  method <- match.arg(method)
+  if (method == "bonferroni") return(alpha / max(1, M))
+  # Minimal FDR placeholder: use alpha directly (recommend replacing with proper BH procedure)
+  alpha
+}
+
+# Analytic power (continuous trait + single-marker, noncentral t approximation)
+# Noncentrality lambda ≈ n * beta^2 * Var(G) / (sigma2 * (1 - rc2))
+power_analytic_single_marker <- function(n, beta, maf, alpha_eff, rc2 = 0, sigma2 = 1) {
+  # Var(G) = 2p(1-p) for additive 0/1/2 coding
+  vg <- 2 * maf * (1 - maf)
+  if (vg < 1e-12) return(0)
+  lambda <- n * (beta^2) * vg / (sigma2 * (1 - rc2 + 1e-12))
+  # Normal approximation (two-sided)
+  z <- qnorm(1 - alpha_eff/2)
+  # Approximate power: P(|Z_nc| > z), where Z_nc ~ N(mean = sqrt(lambda), sd = 1)
+  m <- sqrt(lambda)
+  pwr <- pnorm(-z, mean = m, sd = 1) + (1 - pnorm(z, mean = m, sd = 1))
+  pmin(pmax(pwr, 0), 1)
+}
+
+# Simulated power (repeat B): does at least one true QTL pass genome-wide threshold?
+power_simulate <- function(G, qtl_index, beta, n, B = 200, alpha = 0.05,
+                           alpha_method = "bonferroni", seed = 1) {
+  set.seed(seed)
+  M <- ncol(G)
+  alpha_eff <- effective_alpha(alpha, M, alpha_method)
+  out <- logical(B)
+  for (b in seq_len(B)) {
+    idx <- sample(seq_len(nrow(G)), n, replace = FALSE)
+    Gb <- G[idx, , drop = FALSE]
+    yb <- simulate_trait_gaussian(Gb, qtl_index, beta, h2 = 0.2)
+    pvals <- single_marker_scan(Gb, yb)
+    out[b] <- any(pvals[qtl_index] < alpha_eff)
+  }
+  mean(out)
+}
+
+# Numerical derivative dPower/dn (finite differences)
+dpower_dn_fd <- function(n_vec, pwr_vec) {
+  n <- as.numeric(n_vec); p <- as.numeric(pwr_vec)
+  k <- length(n)
+  d <- rep(NA_real_, k)
+  if (k >= 2) {
+    d[1:(k-1)] <- diff(p)/pmax(1, diff(n))
+    d[k] <- d[k-1]
+  }
+  d
+}
+
+# Sample size solver (binary search on simulated power)
+solve_n_for_power <- function(G, qtl_index, beta, target = 0.8, n_min = 30, n_max = 1000,
+                              alpha = 0.05, alpha_method = "bonferroni", B = 150, seed = 123) {
+  lo <- n_min; hi <- n_max
+  best <- hi
+  while (lo <= hi) {
+    mid <- floor((lo + hi)/2)
+    p_mid <- power_simulate(G, qtl_index, beta, mid, B = B, alpha = alpha,
+                            alpha_method = alpha_method, seed = seed)
+    if (p_mid >= target) { best <- mid; hi <- mid - 1 } else { lo <- mid + 1 }
+  }
+  list(n = best,
+       power = power_simulate(G, qtl_index, beta, best, B = max(250,B),
+                              alpha = alpha, alpha_method = alpha_method, seed = seed))
+}
+
+# Cost function
+cost_fn <- function(n, c_geno = 20, c_pheno = 10, c_fixed = 0) {
+  c_fixed + n * (c_geno + c_pheno)
+}
+
+# -------------------------------------------------------
+# UI
+# -------------------------------------------------------
+ui <- navbarPage(
+  title = "QTL Design Sandbox",
+  theme = shinytheme("flatly"),
+
+  tabPanel("Data",
+           sidebarLayout(
+             sidebarPanel(
+               numericInput("n_ind", "Number of individuals (generate demo)", 400, min = 50, step = 50),
+               numericInput("m_mark", "Number of markers (generate demo)", 200, min = 50, step = 50),
+               sliderInput("maf", "MAF (demo)", min = 0.05, max = 0.5, value = 0.3, step = 0.01),
+               actionButton("btn_gen", "Generate demo genotype"),
+               tags$hr(),
+               fileInput("geno_file", "Or upload genotype (CSV, 0/1/2)", accept = c(".csv")),
+               helpText("Rows = individuals, columns = markers; values = 0/1/2. Start with demo if unsure.")
+             ),
+             mainPanel(
+               h4("Data overview"),
+               DTOutput("geno_head"),
+               tags$hr(),
+               h5("Diversity & homogeneity note (brief)"),
+               verbatimTextOutput("div_warn")
+             )
+           )
+  ),
+
+  tabPanel("Model",
+           sidebarLayout(
+             sidebarPanel(
+               selectInput("model_type", "Statistical model",
+                           c("Single-marker (SIM)", "LMM (placeholder)", "IM/CIM (placeholder)")),
+               numericInput("alpha", "Genome-wide significance α", 0.05, min = 1e-6, step = 0.01),
+               selectInput("alpha_method", "Multiple testing", c("bonferroni", "fdr")),
+               numericInput("rc2", "Covariate explained variance Rc^2 (0–0.5 reasonable)", 0.0,
+                            min = 0, max = 0.9, step = 0.05),
+               helpText("LMM and CIM are placeholders here—use SIM to run end-to-end; swap in full models later.")
+             ),
+             mainPanel(
+               h4("Model notes"),
+               p("This minimal prototype uses single-marker regression (SIM) to demonstrate: analytic derivation + simulation + dPower/dn + sample-size solver.")
+             )
+           )
+  ),
+
+  tabPanel("Power",
+           sidebarLayout(
+             sidebarPanel(
+               numericInput("qtl_idx", "True QTL index (column)", 1, min = 1, step = 1),
+               numericInput("beta_eff", "QTL effect β (standardised)", 0.2, step = 0.05),
+               sliderInput("n_grid", "Sample size grid", min = 50, max = 1000, value = c(100, 500), step = 50),
+               numericInput("grid_step", "Grid step", 50, min = 10, step = 10),
+               numericInput("B_sim", "Simulation repeats B", 200, min = 50, step = 50),
+               actionButton("btn_run", "Run power analysis")
+             ),
+             mainPanel(
+               h4("Analytic vs simulation power curves"),
+               plotOutput("power_plot"),
+               DTOutput("power_table")
+             )
+           )
+  ),
+
+  tabPanel("Derivative (dPower/dn)",
+           sidebarLayout(
+             sidebarPanel(
+               numericInput("deriv_thresh", "Stopping threshold (dPower/dn)", 0.005, step = 0.001),
+               helpText("When marginal gain falls below this threshold, suggest stopping additional sampling.")
+             ),
+             mainPanel(
+               h4("dPower/dn curve"),
+               plotOutput("deriv_plot"),
+               verbatimTextOutput("stop_msg")
+             )
+           )
+  ),
+
+  tabPanel("Solver",
+           sidebarLayout(
+             sidebarPanel(
+               numericInput("target_power", "Target power", 0.8, min = 0.5, max = 0.99, step = 0.01),
+               numericInput("solve_min", "Min n", 50, min = 30),
+               numericInput("solve_max", "Max n", 1000, min = 100),
+               numericInput("B_solve", "Simulation repeats (solver)", 150, min = 50),
+               actionButton("btn_solve", "Solve n*")
+             ),
+             mainPanel(
+               h4("Sample size inversion"),
+               verbatimTextOutput("solve_text")
+             )
+           )
+  ),
+
+  tabPanel("Optimiser",
+           sidebarLayout(
+             sidebarPanel(
+               numericInput("c_geno", "Genotyping cost / sample", 20, min = 0),
+               numericInput("c_pheno", "Phenotyping cost / sample", 10, min = 0),
+               numericInput("c_fixed", "Fixed cost", 0, min = 0),
+               numericInput("budget", "Budget cap (optional)", 20000, min = 0),
+               helpText("Displays unit power cost and over/under-sampling prompts.")
+             ),
+             mainPanel(
+               h4("Power–cost alignment"),
+               verbatimTextOutput("cost_msg")
+             )
+           )
+  ),
+
+  tabPanel("Blackleg Case (ordinal scoring demo)",
+           sidebarLayout(
+             sidebarPanel(
+               sliderInput("ord_levels", "Scoring levels (0..K)", min = 3, max = 7, value = 5),
+               helpText("Minimal demo: bin continuous y into 0..K and use thresholding; replace with cumulative logit GLMM in the full version.")
+             ),
+             mainPanel(
+               h4("Score distribution (rough demo)"),
+               plotOutput("ord_plot")
+             )
+           )
+  ),
+
+  tabPanel("Report",
+           sidebarLayout(
+             sidebarPanel(
+               textInput("proj_name", "Project name", "QTL_Design_Run"),
+               downloadButton("dl_report", "Download parameter summary (txt)")
+             ),
+             mainPanel(
+               h4("Export contents"),
+               p("Export includes: key parameters, analytic/simulation highlights, dPower/dn threshold & suggestions.")
+             )
+           )
+  )
+)
+
+# -------------------------------------------------------
+# SERVER
+# -------------------------------------------------------
+server <- function(input, output, session) {
+
+  # ---- Data ----
+  G_reactive <- reactiveVal(NULL)
+
+  observeEvent(input$btn_gen, {
+    G <- genotype_sim(n = input$n_ind, m = input$m_mark, maf = input$maf)
+    G_reactive(G)
+  }, ignoreInit = TRUE)
+
+  observeEvent(input$geno_file, {
+    req(input$geno_file)
+    df <- fread(input$geno_file$datapath)
+    G <- as.matrix(df)
+    if (!all(G %in% c(0,1,2))) {
+      showNotification("Non 0/1/2 encoding detected; please use additive 0/1/2 coding.", type = "error")
+    }
+    G_reactive(G)
+  }, ignoreInit = TRUE)
+
+  output$geno_head <- renderDT({
+    G <- G_reactive()
+    if (is.null(G)) return(datatable(data.table(Note="Please generate/upload genotype")))
+    datatable(as.data.table(G[1:min(10, nrow(G)), 1:min(10, ncol(G))]), options = list(scrollX = TRUE))
+  })
+
+  output$div_warn <- renderText({
+    G <- G_reactive()
+    if (is.null(G)) return("No data yet.")
+    p_hat <- colMeans(G)/2
+    maf_vec <- pmin(p_hat, 1 - p_hat)
+    txt <- c(
+      glue("Samples: {nrow(G)}, Markers: {ncol(G)}"),
+      glue("Median MAF: {round(median(maf_vec),3)} | Low-diversity markers (MAF<0.05): {round(mean(maf_vec<0.05),3)}")
+    )
+    paste(txt, collapse = "\n")
+  })
+
+  # ---- Power (analytic vs sim) ----
+  power_df <- eventReactive(input$btn_run, {
+    G <- G_reactive(); req(G)
+    qidx <- as.integer(input$qtl_idx); if (qidx < 1 || qidx > ncol(G)) qidx <- 1
+    beta <- input$beta_eff
+    alpha <- input$alpha; method <- input$alpha_method
+    rc2 <- input$rc2
+    n_range <- seq(input$n_grid[1], input$n_grid[2], by = input$grid_step)
+    M <- ncol(G)
+    alpha_eff <- effective_alpha(alpha, M, method)
+
+    # Analytic power (single marker)
+    # Use average maf for the analytic curve (or replace with maf of the true-QTL marker)
+    p_hat <- mean(colMeans(G)/2)
+    maf <- pmin(p_hat, 1 - p_hat)
+
+    pwr_a <- sapply(n_range, function(n)
+      power_analytic_single_marker(n, beta, maf, alpha_eff, rc2 = rc2, sigma2 = 1))
+
+    # Simulated power
+    B <- input$B_sim
+    pwr_s <- sapply(n_range, function(n)
+      power_simulate(G, qtl_index = qidx, beta = beta, n = n, B = B,
+                     alpha = alpha, alpha_method = method))
+
+    data.frame(n = n_range, power_analytic = pwr_a, power_sim = pwr_s)
+  })
+
+  output$power_plot <- renderPlot({
+    df <- power_df(); req(df)
+    ggplot(df, aes(n)) +
+      geom_line(aes(y = power_analytic), linetype = "dashed") +
+      geom_point(aes(y = power_sim)) +
+      labs(y = "Power", title = "Analytic (dashed) vs Simulation (points)") +
+      theme_minimal()
+  })
+
+  output$power_table <- renderDT({
+    df <- power_df(); req(df)
+    datatable(df, options = list(pageLength = 10))
+  })
+
+  # ---- Derivative dPower/dn ----
+  output$deriv_plot <- renderPlot({
+    df <- power_df(); req(df)
+    d <- dpower_dn_fd(df$n, df$power_sim)
+    ddf <- data.frame(n = df$n, dpower = d)
+    thr <- input$deriv_thresh
+    ggplot(ddf, aes(n, dpower)) +
+      geom_line() +
+      geom_hline(yintercept = thr, linetype = "dotted") +
+      labs(y = "dPower/dn (finite diff)", title = "Marginal gain curve") +
+      theme_minimal()
+  })
+
+  output$stop_msg <- renderText({
+    df <- power_df(); req(df)
+    d <- dpower_dn_fd(df$n, df$power_sim)
+    thr <- input$deriv_thresh
+    below <- which(d <= thr)
+    if (length(below) == 0) {
+      "No stopping threshold triggered within the current grid."
+    } else {
+      n_stop <- df$n[min(below)]
+      glue("Suggested stopping point: n ≈ {n_stop} (dPower/dn ≤ {thr})")
+    }
+  })
+
+  # ---- Solver ----
+  solve_res <- eventReactive(input$btn_solve, {
+    G <- G_reactive(); req(G)
+    qidx <- as.integer(input$qtl_idx); if (qidx < 1 || qidx > ncol(G)) qidx <- 1
+    beta <- input$beta_eff
+    alpha <- input$alpha; method <- input$alpha_method
+    solve_n_for_power(G, qtl_index = qidx, beta = beta,
+                      target = input$target_power,
+                      n_min = input$solve_min, n_max = input$solve_max,
+                      alpha = alpha, alpha_method = method,
+                      B = input$B_solve, seed = 321)
+  })
+
+  output$solve_text <- renderText({
+    res <- solve_res(); req(res)
+    glue("Minimum sample size n* = {res$n}\nSimulation-confirmed power ≈ {round(res$power,3)}")
+  })
+
+  # ---- Optimiser ----
+  output$cost_msg <- renderText({
+    df <- power_df(); req(df)
+    # Power and cost
+    C <- cost_fn(df$n, c_geno = input$c_geno, c_pheno = input$c_pheno, c_fixed = input$c_fixed)
+    unit_gain <- c(NA, diff(C)/pmax(1e-6, diff(df$power_sim))) # ΔCost/ΔPower
+    # Budget message
+    if (!is.null(input$budget) && is.finite(input$budget) && input$budget > 0) {
+      ok <- which(C <= input$budget)
+      if (length(ok) == 0) {
+        msg <- "Budget is insufficient for any grid point."
+      } else {
+        n_best <- df$n[max(ok)]
+        p_best <- df$power_sim[max(ok)]
+        msg <- glue("Within budget (≤{input$budget}), best achievable: n = {n_best}, Power ≈ {round(p_best,3)}")
+      }
+    } else {
+      msg <- "No budget cap set."
+    }
+    msg2 <- glue("\nUnit power cost (adjacent-grid approx) at the grid end: {round(tail(unit_gain,1),2)}")
+    paste0(msg, msg2)
+  })
+
+  # ---- Blackleg (rough ordinal scoring demo) ----
+  output$ord_plot <- renderPlot({
+    df <- power_df(); req(df)
+    # Take one recent simulation setting to generate a continuous y, then bin into ordinal categories (demo)
+    G <- G_reactive(); req(G)
+    qidx <- as.integer(input$qtl_idx); beta <- input$beta_eff
+    y <- simulate_trait_gaussian(G, qtl_index = qidx, beta = beta, h2 = 0.2, seed = 99)
+    K <- input$ord_levels
+    breaks <- quantile(y, probs = seq(0, 1, length.out = K+1))
+    score <- cut(y, breaks = unique(breaks), include.lowest = TRUE, labels = FALSE) - 1
+    ggplot(data.frame(score = factor(score)), aes(score)) +
+      geom_bar() + theme_minimal() + labs(x = "Ordinal score (0..K)", y = "Count")
+  })
+
+  # ---- Report (minimal parameter export) ----
+  output$dl_report <- downloadHandler(
+    filename = function() paste0(input$proj_name, "_summary.txt"),
+    content = function(file) {
+      G <- G_reactive()
+      txt <- c(
+        glue("Project: {input$proj_name}"),
+        glue("N x M: {if (is.null(G)) 'NA' else paste(nrow(G), ncol(G), sep=' x ')}"),
+        glue("Model: {input$model_type}, alpha={input$alpha}, mult={input$alpha_method}, Rc2={input$rc2}"),
+        glue("QTL idx={input$qtl_idx}, beta={input$beta_eff}"),
+        glue("n grid: {paste(seq(input$n_grid[1], input$n_grid[2], by = input$grid_step), collapse=', ')}"),
+        glue("B(sim)={input$B_sim}, dPower/dn stop={input$deriv_thresh}"),
+        glue("Target power={input$target_power} (solver bounds {input$solve_min}-{input$solve_max})"),
+        glue("Costs: geno={input$c_geno}, pheno={input$c_pheno}, fixed={input$c_fixed}, budget={input$budget}")
+      )
+      writeLines(txt, con = file)
+    }
+  )
+}
+
+shinyApp(ui, server)
+
+```
+
