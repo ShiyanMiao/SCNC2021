@@ -1,0 +1,3570 @@
+---
+title: "R-shiny-app-week-9"
+author: "Shiyan Miao"
+date: "2025-09-29"
+output: html_document
+---
+
+```{r}
+# app.R
+# QTL Design Sandbox (Shiny, QC + Missing Handling + Model Button + Safe Power Tab)
+# -----------------------------------------------------------------------------
+suppressPackageStartupMessages({
+  library(shiny); library(shinythemes)
+  library(data.table); library(DT); library(ggplot2)
+  library(MASS); library(stats); library(glue)
+  library(irlba)
+})
+
+# -----------------------------
+# Data simulators
+# -----------------------------
+genotype_sim <- function(n = 400, m = 200, maf = 0.3, seed = 1) {
+  set.seed(seed)
+  G <- matrix(rbinom(n * m, 2, maf), nrow = n, ncol = m)
+  colnames(G) <- paste0("M", seq_len(m))
+  G
+}
+
+genotype_sim_realistic <- function(n = 200, m = 400,
+                                   K = 3, maf_center = 0.30,
+                                   maf_walk_sd = 0.01, subpop_drift_sd = 0.05,
+                                   marker_hetero_sd = 0.02,
+                                   block_size = 10, copy_prob = 0.85, mutate_prob = 0.05,
+                                   mean_miss = 0.05, seed = 1) {
+  set.seed(seed)
+  sizes <- rep(floor(n / K), K); sizes[seq_len(n %% K)] <- sizes[seq_len(n %% K)] + 1
+  groups <- rep(seq_len(K), sizes); groups <- sample(groups)
+  p_base <- pmin(pmax(cumsum(rnorm(m, 0, maf_walk_sd)) + maf_center, 0.02), 0.98)
+  drift <- rnorm(K, 0, subpop_drift_sd)
+  p_sub <- sapply(drift, function(d) pmin(pmax(p_base + d, 0.02), 0.98))
+  p_sub <- t(p_sub) + matrix(rnorm(K * m, 0, marker_hetero_sd), nrow = K)
+  p_sub <- pmin(pmax(p_sub, 0.02), 0.98)
+  G <- matrix(NA_real_, nrow = n, ncol = m)
+  for (i in seq_len(n)) G[i, ] <- rbinom(m, 2, p_sub[groups[i], ])
+  for (start in seq(1, m, by = block_size)) {
+    end <- min(start + block_size - 1, m)
+    if (end > start) {
+      ref <- start
+      for (j in (ref + 1):end) {
+        mask <- runif(n) < copy_prob
+        G[mask, j] <- G[mask, ref]
+        flip <- runif(n) < mutate_prob
+        if (any(flip)) G[flip, j] <- rbinom(sum(flip), 2, p_base[j])
+      }
+    }
+  }
+  a <- 1.2; b <- max(a / max(1e-6, mean_miss) - a, 1.1)
+  miss_rate <- rbeta(m, a, b)
+  for (j in seq_len(m)) {
+    miss <- runif(n) < miss_rate[j]
+    if (any(miss)) G[miss, j] <- NA
+  }
+  colnames(G) <- paste0("M", seq_len(m))
+  G
+}
+
+# -----------------------------
+# Trait + association
+# -----------------------------
+simulate_trait_gaussian <- function(G, qtl_index, beta, h2 = 0.2, rc2 = 0, seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  n <- nrow(G)
+  g_eff <- as.numeric(G[, qtl_index, drop = FALSE] %*% beta)
+  var_g <- var(g_eff); if (var_g < 1e-12) var_g <- 1e-12
+  sigma2_e <- (var_g - h2 * var_g) / h2
+  if (sigma2_e <= 0) sigma2_e <- 1e-6
+  y <- scale(g_eff + rnorm(n, 0, sqrt(sigma2_e)), center = TRUE, scale = TRUE)[,1]
+  attr(y, "sigma2_e") <- sigma2_e
+  y
+}
+
+single_marker_scan <- function(G, y) {
+  # returns p-values and t-statistics per marker with NA-safe LM
+  nmark <- ncol(G)
+  pvals <- numeric(nmark); tstats <- numeric(nmark)
+  for (j in seq_len(nmark)) {
+    fit <- try(suppressWarnings(lm(y ~ G[, j], na.action = na.omit)), silent = TRUE)
+    if (inherits(fit, "try-error")) { pvals[j] <- NA_real_; tstats[j] <- NA_real_; next }
+    sm <- summary(fit)$coefficients
+    if (nrow(sm) >= 2) { pvals[j] <- sm[2,4]; tstats[j] <- sm[2,3] } else { pvals[j] <- NA_real_; tstats[j] <- NA_real_ }
+  }
+  list(p = pvals, t = tstats)
+}
+
+effective_alpha <- function(alpha, M, method = c("bonferroni","fdr")) {
+  method <- match.arg(method)
+  if (method == "bonferroni") return(alpha / max(1, M))
+  alpha
+}
+
+power_analytic_single_marker <- function(n, beta, maf, alpha_eff, rc2 = 0, sigma2 = 1) {
+  vg <- 2 * maf * (1 - maf); if (vg < 1e-12) return(0)
+  lambda <- n * (beta^2) * vg / (sigma2 * (1 - rc2 + 1e-12))
+  z <- qnorm(1 - alpha_eff/2); m <- sqrt(lambda)
+  pwr <- pnorm(-z, mean = m, sd = 1) + (1 - pnorm(z, mean = m, sd = 1))
+  pmin(pmax(pwr, 0), 1)
+}
+
+# ----- PATCH #2: robust simulation (clamp n to [2, N], guard M) -----
+power_simulate <- function(G, qtl_index, beta, n, B = 200, alpha = 0.05,
+                           alpha_method = "bonferroni", seed = 1) {
+  set.seed(seed)
+  M <- ncol(G)
+  if (M < 1) return(0)                 # no markers → 0 power
+  qtl_index <- max(1, min(qtl_index, M))
+  alpha_eff <- effective_alpha(alpha, M, alpha_method)
+  out <- logical(B)
+  N <- nrow(G)
+  n_eff <- max(2L, min(as.integer(n), N))  # clamp to [2, N]
+  for (b in seq_len(B)) {
+    idx <- sample.int(N, n_eff, replace = FALSE)
+    Gb <- G[idx, , drop = FALSE]
+    yb <- simulate_trait_gaussian(Gb, qtl_index, beta, h2 = 0.2)
+    res <- single_marker_scan(Gb, yb)
+    out[b] <- any(res$p[qtl_index] < alpha_eff, na.rm = TRUE)
+  }
+  mean(out)
+}
+
+dpower_dn_fd <- function(n_vec, pwr_vec) {
+  n <- as.numeric(n_vec); p <- as.numeric(pwr_vec)
+  k <- length(n); d <- rep(NA_real_, k)
+  if (k >= 2) { d[1:(k-1)] <- diff(p)/pmax(1, diff(n)); d[k] <- d[k-1] }
+  d
+}
+
+solve_n_for_power <- function(G, qtl_index, beta, target = 0.8, n_min = 30, n_max = 1000,
+                              alpha = 0.05, alpha_method = "bonferroni", B = 150, seed = 123) {
+  lo <- n_min; hi <- n_max; best <- hi
+  while (lo <= hi) {
+    mid <- floor((lo + hi)/2)
+    p_mid <- power_simulate(G, qtl_index, beta, mid, B = B, alpha = alpha,
+                            alpha_method = alpha_method, seed = seed)
+    if (p_mid >= target) { best <- mid; hi <- mid - 1 } else { lo <- mid + 1 }
+  }
+  list(n = best,
+       power = power_simulate(G, qtl_index, beta, best, B = max(250,B),
+                              alpha = alpha, alpha_method = alpha_method, seed = seed))
+}
+
+# -----------------------------
+# QC & missing handling
+# -----------------------------
+compute_qc <- function(G) {
+  miss_mark <- colMeans(is.na(G))
+  miss_ind  <- rowMeans(is.na(G))
+  p_hat <- colMeans(G, na.rm = TRUE)/2
+  maf <- pmin(p_hat, 1 - p_hat)
+  list(miss_mark = miss_mark, miss_ind = miss_ind, maf = maf)
+}
+apply_filters <- function(G, max_miss_mark=0.1, max_miss_ind=0.1, maf_min=0.01) {
+  qc <- compute_qc(G)
+  keep_mark <- which(qc$miss_mark <= max_miss_mark & qc$maf >= maf_min & !is.na(qc$maf))
+  keep_ind  <- which(qc$miss_ind <= max_miss_ind)
+  if (length(keep_mark) == 0 || length(keep_ind) == 0) return(G[0,0,drop=FALSE])
+  G[keep_ind, keep_mark, drop = FALSE]
+}
+apply_missing_action <- function(G, mode = c("impute", "drop_rows_with_na", "drop_cols_with_na", "none")) {
+  mode <- match.arg(mode)
+  if (is.null(G)) return(G)
+  if (mode == "none") return(G)
+  if (mode == "drop_rows_with_na") return(G[rowSums(is.na(G)) == 0, , drop = FALSE])
+  if (mode == "drop_cols_with_na") return(G[, colSums(is.na(G)) == 0, drop = FALSE])
+  cm <- colMeans(G, na.rm = TRUE)
+  for (j in seq_len(ncol(G))) {
+    idx <- which(is.na(G[, j])); if (length(idx)) G[idx, j] <- cm[j]
+  }
+  G
+}
+
+# -----------------------------
+# UI
+# -----------------------------
+ui <- navbarPage(
+  title = "QTL Design Sandbox",
+  theme = shinytheme("flatly"),
+
+  tabPanel("Data",
+    sidebarLayout(
+      sidebarPanel(
+        numericInput("n_ind",  "Number of individuals (demo)", 400, min = 50, step = 50),
+        numericInput("m_mark", "Number of markers (demo)",     200, min = 50, step = 50),
+        sliderInput("maf", "MAF (demo)", min = 0.05, max = 0.5, value = 0.3, step = 0.01),
+        checkboxInput("demo_realistic", "Use realistic demo (subpop + LD + missingness)", TRUE),
+        actionButton("btn_gen", "Generate demo genotype"),
+        tags$hr(),
+        fileInput("geno_file", "Or upload genotype (CSV, 0/1/2)", accept = c(".csv")),
+        helpText("Format: rows = individuals, columns = markers; values = 0/1/2 (NA allowed)."),
+        tags$hr(),
+        h4("Missing-data handling"),
+        radioButtons("missing_mode", NULL,
+          c("Impute by column mean (recommended)" = "impute",
+            "Drop rows with any NA" = "drop_rows_with_na",
+            "Drop columns with any NA" = "drop_cols_with_na",
+            "Do nothing" = "none"), selected = "impute"),
+        actionButton("btn_missing_apply", "Apply missing-data handling"),
+        tags$hr(),
+        h4("QC Filters"),
+        sliderInput("f_miss_mark", "Marker missingness max (%)", min = 0, max = 50, value = 20, step = 1),
+        sliderInput("f_miss_ind",  "Individual missingness max (%)", min = 0, max = 50, value = 20, step = 1),
+        sliderInput("f_maf_min",   "MAF minimum", min = 0.0, max = 0.1, value = 0.01, step = 0.005),
+        checkboxInput("apply_filters_downstream", "Use filtered data for analysis", TRUE),
+        actionButton("btn_qc", "Run QC & Apply Filters"),
+        tags$hr(),
+        actionButton("btn_refs", "Show References")
+      ),
+      mainPanel(
+        h4("Data overview"),
+        DTOutput("geno_head"),
+        tags$hr(),
+        fluidRow(
+          column(6,
+            h4("Dimensions & MAF"),
+            verbatimTextOutput("dim_maf_summary"),
+            plotOutput("maf_hist", height = 220)
+          ),
+          column(6,
+            h4("Missingness"),
+            plotOutput("miss_mark_hist", height = 220),
+            plotOutput("miss_ind_hist", height = 220),
+            verbatimTextOutput("missing_action_summary")
+          )
+        ),
+        tags$hr(),
+        h4("QC Summary"),
+        verbatimTextOutput("qc_summary")
+      )
+    )
+  ),
+
+  tabPanel("Model",
+    sidebarLayout(
+      sidebarPanel(
+        selectInput("model_type", "Statistical model",
+          c("Single-marker (SIM)" = "sim", "LMM (placeholder)" = "lmm")),
+        numericInput("alpha", "Genome-wide significance α", 0.05, min = 1e-6, step = 0.01),
+        selectInput("alpha_method", "Multiple testing", c("bonferroni", "fdr")),
+        numericInput("rc2", "Covariate explained variance Rc^2", 0.0, min = 0, max = 0.9, step = 0.05),
+        tags$hr(),
+        numericInput("qtl_idx_model", "True QTL index (column)", 1, min = 1, step = 1),
+        numericInput("beta_eff_model", "QTL effect β (standardised)", 0.2, step = 0.05),
+        actionButton("btn_model_fit", "Run model analysis")
+      ),
+      mainPanel(
+        h4("Model analysis summary"),
+        verbatimTextOutput("model_summary"),
+        h4("t-distribution (df = n_eff − 2) with observed t"),
+        plotOutput("t_plot", height = 300)
+      )
+    )
+  ),
+
+  tabPanel("Power",
+    sidebarLayout(
+      sidebarPanel(
+        numericInput("qtl_idx", "True QTL index (column)", 1, min = 1, step = 1),
+        numericInput("beta_eff", "QTL effect β (standardised)", 0.2, step = 0.05),
+        sliderInput("n_grid", "Sample size grid", min = 50, max = 1000, value = c(100, 500), step = 50),
+        numericInput("grid_step", "Grid step", 50, min = 10, step = 10),
+        numericInput("B_sim", "Simulation repeats B", 200, min = 50, step = 50),
+        actionButton("btn_run", "Run power analysis")
+      ),
+      mainPanel(
+        h4("Analytic vs simulation power curves"),
+        plotOutput("power_plot"),
+        DTOutput("power_table")
+      )
+    )
+  ),
+
+  tabPanel("Derivative (dPower/dn)",
+    sidebarLayout(
+      sidebarPanel(
+        numericInput("deriv_thresh", "Stopping threshold (dPower/dn)", 0.005, step = 0.001),
+        helpText("When marginal gain falls below this threshold, suggest stopping additional sampling.")
+      ),
+      mainPanel(
+        h4("dPower/dn curve"),
+        plotOutput("deriv_plot"),
+        verbatimTextOutput("stop_msg")
+      )
+    )
+  ),
+
+  tabPanel("Solver",
+    sidebarLayout(
+      sidebarPanel(
+        numericInput("target_power", "Target power", 0.8, min = 0.5, max = 0.99, step = 0.01),
+        numericInput("solve_min", "Min n", 50, min = 30),
+        numericInput("solve_max", "Max n", 1000, min = 100),
+        numericInput("B_solve", "Simulation repeats (solver)", 150, min = 50),
+        actionButton("btn_solve", "Solve n*")
+      ),
+      mainPanel(
+        h4("Sample size inversion"),
+        verbatimTextOutput("solve_text")
+      )
+    )
+  ),
+
+  tabPanel("Report",
+    sidebarLayout(
+      sidebarPanel(
+        textInput("proj_name", "Project name", "QTL_Design_Run"),
+        downloadButton("dl_report", "Download parameter summary (txt)")
+      ),
+      mainPanel(
+        h4("Export contents"),
+        p("Export includes: key parameters, analytic/simulation highlights, dPower/dn threshold & suggestions.")
+      )
+    )
+  )
+)
+
+# -----------------------------
+# SERVER
+# -----------------------------
+server <- function(input, output, session) {
+
+  G_raw  <- reactiveVal(NULL)
+  G_filt <- reactiveVal(NULL)
+  G_step_missing <- reactiveVal(NULL)
+
+  fallback_demo <- reactive({
+    genotype_sim_realistic(n = 200, m = 400, seed = 1)
+  })
+
+  # ----- PATCH #1: robust active matrix (fallback to demo when empty) -----
+  G_active <- reactive({
+    # prefer filtered → missing-handled → raw
+    Gcand <- if (isTRUE(input$apply_filters_downstream) && !is.null(G_filt())) {
+      G_filt()
+    } else if (!is.null(G_step_missing())) {
+      G_step_missing()
+    } else if (!is.null(G_raw())) {
+      G_raw()
+    } else {
+      NULL
+    }
+    # fall back to demo when NULL / too few rows / no columns
+    if (is.null(Gcand) || nrow(Gcand) < 2 || ncol(Gcand) < 1) return(fallback_demo())
+    Gcand
+  })
+
+  observeEvent(input$btn_gen, {
+    if (isTRUE(input$demo_realistic)) {
+      G <- genotype_sim_realistic(n = input$n_ind, m = input$m_mark, maf_center = input$maf, seed = 1)
+    } else {
+      G <- genotype_sim(n = input$n_ind, m = input$m_mark, maf = input$maf)
+    }
+    G_raw(G); G_step_missing(NULL); G_filt(NULL)
+  }, ignoreInit = TRUE)
+
+  observeEvent(input$geno_file, {
+    req(input$geno_file)
+    df <- fread(input$geno_file$datapath)
+    G  <- as.matrix(df)
+    if (!all(G %in% c(0,1,2, NA))) {
+      showNotification("Non 0/1/2 encoding detected; please use additive 0/1/2 coding (NA allowed).", type = "error")
+      return(NULL)
+    }
+    G_raw(G); G_step_missing(NULL); G_filt(NULL)
+  }, ignoreInit = TRUE)
+
+  observeEvent(input$btn_missing_apply, {
+    G0 <- G_raw()
+    if (is.null(G0)) { showNotification("No raw genotype available. Use demo or upload.", type = "warning"); return(NULL) }
+    G1 <- apply_missing_action(G0, mode = input$missing_mode)
+    G_step_missing(G1); G_filt(NULL)
+  }, ignoreInit = TRUE)
+
+  qc_results <- eventReactive(input$btn_qc, {
+    G0 <- if (!is.null(G_step_missing())) G_step_missing() else G_raw()
+    if (is.null(G0)) G0 <- fallback_demo()
+    qc0 <- compute_qc(G0)
+    G1 <- apply_filters(G0, max_miss_mark = input$f_miss_mark/100,
+                             max_miss_ind  = input$f_miss_ind/100,
+                             maf_min       = input$f_maf_min)
+    qc1 <- compute_qc(G1)
+    G_filt(G1)
+    list(G0=G0, qc0=qc0, G1=G1, qc1=qc1)
+  }, ignoreInit = TRUE)
+
+  output$geno_head <- renderDT({
+    G <- if(!is.null(G_raw())) G_raw() else fallback_demo()
+    datatable(as.data.table(G[1:min(10, nrow(G)), 1:min(10, ncol(G))]), options = list(scrollX = TRUE))
+  })
+
+  output$dim_maf_summary <- renderText({
+    G0 <- if(!is.null(G_raw())) G_raw() else fallback_demo()
+    qc0 <- compute_qc(G0)
+    txt <- glue("Raw (or fallback): N x M = {nrow(G0)} x {ncol(G0)} | Median MAF = {round(median(qc0$maf, na.rm=TRUE),3)}")
+    if (!is.null(G_step_missing())) {
+      Gm <- G_step_missing(); qcm <- compute_qc(Gm)
+      txt <- paste0(txt, "\n", glue("After missing-handling: N x M = {nrow(Gm)} x {ncol(Gm)} | Median MAF = {round(median(qcm$maf, na.rm=TRUE),3)}"))
+    }
+    if (!is.null(G_filt())) {
+      G1 <- G_filt(); qc1 <- compute_qc(G1)
+      txt <- paste0(txt, "\n", glue("Filtered: N x M = {nrow(G1)} x {ncol(G1)} | Median MAF = {round(median(qc1$maf, na.rm=TRUE),3)}"))
+    }
+    txt
+  })
+
+  output$maf_hist <- renderPlot({
+    G <- if(!is.null(G_raw())) G_raw() else fallback_demo()
+    df <- data.frame(MAF = compute_qc(G)$maf)
+    ggplot(df, aes(MAF)) + geom_histogram(bins = 40, na.rm = TRUE) +
+      theme_minimal() + labs(title="MAF distribution (raw)", x="MAF", y="Count")
+  })
+
+  output$miss_mark_hist <- renderPlot({
+    G <- if(!is.null(G_raw())) G_raw() else fallback_demo()
+    df <- data.frame(miss = compute_qc(G)$miss_mark * 100)
+    ggplot(df, aes(miss)) + geom_histogram(bins = 40, na.rm = TRUE) +
+      theme_minimal() + labs(title="Marker missingness (%)", x="%", y="Count")
+  })
+
+  output$miss_ind_hist <- renderPlot({
+    G <- if(!is.null(G_raw())) G_raw() else fallback_demo()
+    df <- data.frame(miss = compute_qc(G)$miss_ind * 100)
+    ggplot(df, aes(miss)) + geom_histogram(bins = 40, na.rm = TRUE) +
+      theme_minimal() + labs(title="Individual missingness (%)", x="%", y="Count")
+  })
+
+  output$missing_action_summary <- renderText({
+    if (is.null(G_raw())) return("Missing-data handling: waiting for raw genotype (or use demo).")
+    mode <- switch(input$missing_mode,
+                   impute = "Impute by column mean",
+                   drop_rows_with_na = "Drop rows with any NA",
+                   drop_cols_with_na = "Drop columns with any NA",
+                   none = "Do nothing")
+    glue("Selected missing-data handling: {mode}. Click 'Apply' to effect.")
+  })
+
+  output$qc_summary <- renderText({
+    G0 <- if(!is.null(G_raw())) G_raw() else fallback_demo()
+    qc0 <- compute_qc(G0)
+    msg <- c(glue("Raw (or fallback): N x M = {nrow(G0)} x {ncol(G0)}; median MAF = {round(median(qc0$maf,na.rm=TRUE),3)};"),
+             glue("Low-diversity markers (MAF<0.05): {round(mean(qc0$maf<0.05, na.rm=TRUE),3)}"))
+    if (!is.null(G_filt())) {
+      G1 <- G_filt(); qc1 <- compute_qc(G1)
+      msg <- c(msg,
+        glue("Filtered: N x M = {nrow(G1)} x {ncol(G1)}; median MAF = {round(median(qc1$maf,na.rm=TRUE),3)};"),
+        glue("Low-diversity markers (MAF<0.05): {round(mean(qc1$maf<0.05, na.rm=TRUE),3)}"),
+        glue("Bonferroni alpha/M: {input$alpha}/{ncol(G0)} -> {input$alpha}/{ncol(G1)}")
+      )
+    }
+    paste(msg, collapse = "\n")
+  })
+
+  # ---------------- Model page (safe for realistic demo with NA) ----------------
+  model_fit_res <- eventReactive(input$btn_model_fit, {
+    G <- G_active()
+    qidx <- as.integer(input$qtl_idx_model); if (qidx < 1 || qidx > ncol(G)) qidx <- 1
+
+    # mean-impute the chosen QTL column to avoid NA in simulate_trait_gaussian
+    G_use <- G
+    cm <- mean(G_use[, qidx], na.rm = TRUE); if (!is.finite(cm)) cm <- 0
+    na_rows <- which(is.na(G_use[, qidx])); if (length(na_rows)) G_use[na_rows, qidx] <- cm
+
+    beta <- input$beta_eff_model
+    y <- simulate_trait_gaussian(G_use, qtl_index = qidx, beta = beta, h2 = 0.2, seed = 123)
+
+    scan <- single_marker_scan(G_use, y)
+    list(G = G_use, y = y, scan = scan, qidx = qidx)
+  }, ignoreInit = TRUE)
+
+  output$model_summary <- renderText({
+    res <- model_fit_res()
+    G <- res$G; qidx <- res$qidx; p <- res$scan$p; tstats <- res$scan$t
+    alpha_eff <- effective_alpha(input$alpha, ncol(G), input$alpha_method)
+    passed <- isTRUE(p[qidx] < alpha_eff)
+    p_show <- if (is.finite(p[qidx])) signif(p[qidx], 3) else NA
+    t_show <- if (is.finite(tstats[qidx])) round(tstats[qidx], 3) else NA
+    glue("Model: {input$model_type}; alpha={input$alpha} ({input$alpha_method}), effective alpha={signif(alpha_eff,3)}\n",
+         "N x M = {nrow(G)} x {ncol(G)}; selected marker = {qidx}\n",
+         "Observed t = {t_show}, p = {p_show}; ",
+         if (passed) 'PASS genome-wide threshold' else 'NOT significant at genome-wide level')
+  })
+
+  output$t_plot <- renderPlot({
+    res <- model_fit_res()
+    cc <- complete.cases(res$y, res$G[, res$qidx])
+    n_eff <- sum(cc); df <- max(1, n_eff - 2)
+    alpha_eff <- effective_alpha(input$alpha, ncol(res$G), input$alpha_method)
+    alpha_eff <- min(max(alpha_eff, 1e-12), 0.999999)
+    tcrit <- qt(1 - alpha_eff/2, df = df)
+    t_obs <- res$scan$t[res$qidx]; if (!is.finite(t_obs)) t_obs <- 0
+    xs <- seq(-4*max(1,abs(tcrit)), 4*max(1,abs(tcrit)), length.out = 1000)
+    dens <- dt(xs, df = df)
+    ggplot(data.frame(x=xs, y=dens), aes(x,y)) +
+      geom_line() +
+      geom_vline(xintercept = c(-tcrit, tcrit), linetype = "dashed") +
+      geom_vline(xintercept = t_obs, linetype = "solid") +
+      theme_minimal() +
+      labs(title = glue("t-distribution (df={df}); dashed=±t_crit, solid=t_obs"),
+           x = "t", y = "density")
+  })
+
+  # ---------------- Power page (robust) ----------------
+  power_df <- eventReactive(input$btn_run, {
+    G <- G_active(); req(G)
+
+    # ----- PATCH #3: robust qidx, grid n, and maf -----
+    qidx <- as.integer(input$qtl_idx)
+    M <- ncol(G)
+    qidx <- if (is.finite(qidx) && qidx >= 1 && qidx <= M) qidx else 1
+
+    beta  <- input$beta_eff
+    alpha <- input$alpha
+    method <- input$alpha_method
+    rc2 <- input$rc2
+
+    n_range <- seq(input$n_grid[1], input$n_grid[2], by = input$grid_step)
+    # clamp n to [2, N]; if empty, use a safe single value
+    N <- nrow(G)
+    n_range <- n_range[n_range >= 2 & n_range <= N]
+    if (length(n_range) == 0) n_range <- pmin(max(2, floor(N/2)), N)
+
+    alpha_eff <- effective_alpha(alpha, M, method)
+
+    # safe maf (fallback to 0.25)
+    if (M >= 1) {
+      p_hat <- mean(colMeans(G, na.rm = TRUE) / 2)
+      maf <- pmin(p_hat, 1 - p_hat)
+      if (!is.finite(maf) || maf <= 0) maf <- 0.25
+    } else {
+      maf <- 0.25
+    }
+
+    pwr_a <- sapply(n_range, function(n)
+      power_analytic_single_marker(n, beta, maf, alpha_eff, rc2 = rc2, sigma2 = 1))
+
+    B <- input$B_sim
+    pwr_s <- sapply(n_range, function(n)
+      power_simulate(G, qtl_index = qidx, beta = beta, n = n, B = B,
+                     alpha = alpha, alpha_method = method))
+
+    data.frame(n = n_range, power_analytic = pwr_a, power_sim = pwr_s)
+  })
+
+  output$power_plot <- renderPlot({
+    df <- power_df(); req(df)
+    ggplot(df, aes(n)) +
+      geom_line(aes(y = power_analytic), linetype = "dashed") +
+      geom_point(aes(y = power_sim)) +
+      labs(y = "Power", title = "Analytic (dashed) vs Simulation (points)") +
+      theme_minimal()
+  })
+
+  output$power_table <- renderDT({
+    df <- power_df(); req(df)
+    datatable(df, options = list(pageLength = 10))
+  })
+
+  # ---------------- Derivative ----------------
+  output$deriv_plot <- renderPlot({
+    df <- power_df(); req(df)
+    d <- dpower_dn_fd(df$n, df$power_sim)
+    ggplot(data.frame(n=df$n, dpower=d), aes(n, dpower)) +
+      geom_line() +
+      geom_hline(yintercept = input$deriv_thresh, linetype = "dotted") +
+      labs(y = "dPower/dn (finite diff)", title = "Marginal gain curve") +
+      theme_minimal()
+  })
+
+  output$stop_msg <- renderText({
+    df <- power_df(); req(df)
+    d <- dpower_dn_fd(df$n, df$power_sim)
+    below <- which(d <= input$deriv_thresh)
+    if (length(below) == 0) "No stopping threshold triggered within the current grid."
+    else glue("Suggested stopping point: n ≈ {df$n[min(below)]} (dPower/dn ≤ {input$deriv_thresh})")
+  })
+
+  # ---------------- Solver ----------------
+  solve_res <- eventReactive(input$btn_solve, {
+    G <- G_active(); req(G)
+    qidx <- as.integer(input$qtl_idx); if (qidx < 1 || qidx > ncol(G)) qidx <- 1
+    solve_n_for_power(G, qtl_index = qidx, beta = input$beta_eff,
+                      target = input$target_power,
+                      n_min = input$solve_min, n_max = input$solve_max,
+                      alpha = input$alpha, alpha_method = input$alpha_method,
+                      B = input$B_solve, seed = 321)
+  })
+
+  output$solve_text <- renderText({
+    res <- solve_res(); req(res)
+    glue("Minimum sample size n* = {res$n}\nSimulation-confirmed power ≈ {round(res$power,3)}")
+  })
+
+  # ---------------- Report ----------------
+  output$dl_report <- downloadHandler(
+    filename = function() paste0(input$proj_name, "_summary.txt"),
+    content = function(file) {
+      G <- G_active()
+      txt <- c(
+        glue("Project: {input$proj_name}"),
+        glue("N x M: {nrow(G)} x {ncol(G)}"),
+        glue("Model: {input$model_type}, alpha={input$alpha}, mult={input$alpha_method}, Rc2={input$rc2}"),
+        glue("QTL idx={input$qtl_idx}, beta={input$beta_eff}"),
+        glue("n grid: {paste(seq(input$n_grid[1], input$n_grid[2], by = input$grid_step), collapse=', ')}"),
+        glue("B(sim)={input$B_sim}, dPower/dn stop={input$deriv_thresh}"),
+        glue("Target power={input$target_power} (solver bounds {input$solve_min}-{input$solve_max})")
+      )
+      writeLines(txt, con = file)
+    }
+  )
+
+  # References modal (unchanged)
+  observeEvent(input$btn_refs, {
+    dat <- data.frame(
+      Topic = c("Multiple testing (FDR)", "LMM for population structure"),
+      Citation = c("Benjamini & Hochberg (1995) JRSS-B", "Kang et al. (2010) EMMAX; Lippert et al. (2011) FaST-LMM"),
+      Link = c("https://doi.org/10.1111/j.2517-6161.1995.tb02031.x", "https://doi.org/10.1038/ng.548"),
+      stringsAsFactors = FALSE
+    )
+    showModal(modalDialog(
+      title = "References",
+      DTOutput("refs_table"),
+      easyClose = TRUE, size = "l", footer = NULL
+    ))
+    output$refs_table <- renderDT({
+      dat$Link <- sprintf("<a href='%s' target='_blank'>link</a>", dat$Link)
+      datatable(dat, escape = FALSE, options = list(pageLength = 10))
+    })
+  })
+}
+
+shinyApp(ui, server)
+
+```
+
+```{r}
+# app.R
+# QTL Design Sandbox (Shiny, robust Power tab + safe indices/grid)
+# ----------------------------------------------------------------
+suppressPackageStartupMessages({
+  library(shiny); library(shinythemes)
+  library(data.table); library(DT); library(ggplot2)
+  library(MASS); library(stats); library(glue)
+  library(irlba)
+})
+
+# -----------------------------
+# Data simulators
+# -----------------------------
+genotype_sim <- function(n = 400, m = 200, maf = 0.3, seed = 1) {
+  set.seed(seed)
+  G <- matrix(rbinom(n * m, 2, maf), nrow = n, ncol = m)
+  colnames(G) <- paste0("M", seq_len(m))
+  G
+}
+
+genotype_sim_realistic <- function(n = 200, m = 400,
+                                   K = 3, maf_center = 0.30,
+                                   maf_walk_sd = 0.01, subpop_drift_sd = 0.05,
+                                   marker_hetero_sd = 0.02,
+                                   block_size = 10, copy_prob = 0.85, mutate_prob = 0.05,
+                                   mean_miss = 0.05, seed = 1) {
+  set.seed(seed)
+  sizes <- rep(floor(n / K), K); sizes[seq_len(n %% K)] <- sizes[seq_len(n %% K)] + 1
+  groups <- rep(seq_len(K), sizes); groups <- sample(groups)
+  p_base <- pmin(pmax(cumsum(rnorm(m, 0, maf_walk_sd)) + maf_center, 0.02), 0.98)
+  drift <- rnorm(K, 0, subpop_drift_sd)
+  p_sub <- sapply(drift, function(d) pmin(pmax(p_base + d, 0.02), 0.98))
+  p_sub <- t(p_sub) + matrix(rnorm(K * m, 0, marker_hetero_sd), nrow = K)
+  p_sub <- pmin(pmax(p_sub, 0.02), 0.98)
+  G <- matrix(NA_real_, nrow = n, ncol = m)
+  for (i in seq_len(n)) G[i, ] <- rbinom(m, 2, p_sub[groups[i], ])
+  for (start in seq(1, m, by = block_size)) {
+    end <- min(start + block_size - 1, m)
+    if (end > start) {
+      ref <- start
+      for (j in (ref + 1):end) {
+        mask <- runif(n) < copy_prob
+        G[mask, j] <- G[mask, ref]
+        flip <- runif(n) < mutate_prob
+        if (any(flip)) G[flip, j] <- rbinom(sum(flip), 2, p_base[j])
+      }
+    }
+  }
+  a <- 1.2; b <- max(a / max(1e-6, mean_miss) - a, 1.1)
+  miss_rate <- rbeta(m, a, b)
+  for (j in seq_len(m)) {
+    miss <- runif(n) < miss_rate[j]
+    if (any(miss)) G[miss, j] <- NA
+  }
+  colnames(G) <- paste0("M", seq_len(m))
+  G
+}
+
+# -----------------------------
+# Trait + association
+# -----------------------------
+simulate_trait_gaussian <- function(G, qtl_index, beta, h2 = 0.2, rc2 = 0, seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  n <- nrow(G)
+  g_eff <- as.numeric(G[, qtl_index, drop = FALSE] %*% beta)
+  var_g <- var(g_eff); if (var_g < 1e-12) var_g <- 1e-12
+  sigma2_e <- (var_g - h2 * var_g) / h2
+  if (sigma2_e <= 0) sigma2_e <- 1e-6
+  y <- scale(g_eff + rnorm(n, 0, sqrt(sigma2_e)), center = TRUE, scale = TRUE)[,1]
+  attr(y, "sigma2_e") <- sigma2_e
+  y
+}
+
+single_marker_scan <- function(G, y) {
+  # returns p-values and t-statistics per marker with NA-safe LM
+  nmark <- ncol(G)
+  pvals <- numeric(nmark); tstats <- numeric(nmark)
+  for (j in seq_len(nmark)) {
+    fit <- try(suppressWarnings(lm(y ~ G[, j], na.action = na.omit)), silent = TRUE)
+    if (inherits(fit, "try-error")) { pvals[j] <- NA_real_; tstats[j] <- NA_real_; next }
+    sm <- summary(fit)$coefficients
+    if (nrow(sm) >= 2) { pvals[j] <- sm[2,4]; tstats[j] <- sm[2,3] } else { pvals[j] <- NA_real_; tstats[j] <- NA_real_ }
+  }
+  list(p = pvals, t = tstats)
+}
+
+effective_alpha <- function(alpha, M, method = c("bonferroni","fdr")) {
+  method <- match.arg(method)
+  if (method == "bonferroni") return(alpha / max(1, M))
+  alpha
+}
+
+power_analytic_single_marker <- function(n, beta, maf, alpha_eff, rc2 = 0, sigma2 = 1) {
+  vg <- 2 * maf * (1 - maf); if (vg < 1e-12) return(0)
+  lambda <- n * (beta^2) * vg / (sigma2 * (1 - rc2 + 1e-12))
+  z <- qnorm(1 - alpha_eff/2); m <- sqrt(lambda)
+  pwr <- pnorm(-z, mean = m, sd = 1) + (1 - pnorm(z, mean = m, sd = 1))
+  pmin(pmax(pwr, 0), 1)
+}
+
+# -----------------------------
+# SAFE HELPERS（新的防呆工具）
+# -----------------------------
+# 将索引安全化：若 idx 非法/NA，则给默认值（默认 1）
+safe_index <- function(idx, M, default = 1L) {
+  idx <- suppressWarnings(as.integer(idx))
+  if (is.na(idx) || !is.finite(M) || M < 1L) return(as.integer(default))
+  if (idx < 1L || idx > M) return(as.integer(default))
+  as.integer(idx)
+}
+
+# 取样本量网格的安全区间；当 grid/step 含 NA 时给出兜底
+safe_n_grid <- function(n_grid, step, N, fallback = NULL) {
+  n1 <- n_grid[1]; n2 <- n_grid[2]
+  if (!is.finite(n1)) n1 <- 100
+  if (!is.finite(n2)) n2 <- max(150, n1 + 50)
+  if (!is.finite(step) || step <= 0) step <- 50
+  xs <- seq(n1, n2, by = step)
+  xs <- xs[is.finite(xs)]
+  xs <- xs[xs >= 2 & xs <= N]
+  if (length(xs) == 0L) {
+    if (is.null(fallback)) xs <- pmin(max(2L, floor(N/2)), N) else xs <- fallback
+  }
+  as.integer(xs)
+}
+
+# -----------------------------
+# Robust simulation (clamp n)
+# -----------------------------
+power_simulate <- function(G, qtl_index, beta, n, B = 200, alpha = 0.05,
+                           alpha_method = "bonferroni", seed = 1) {
+  set.seed(seed)
+  M <- ncol(G)
+  if (M < 1) return(0)                 # no markers → 0 power
+  qtl_index <- max(1L, min(as.integer(qtl_index), M))
+  alpha_eff <- effective_alpha(alpha, M, alpha_method)
+  out <- logical(B)
+  N <- nrow(G)
+  n_eff <- max(2L, min(as.integer(n), N))  # clamp to [2, N]
+  for (b in seq_len(B)) {
+    idx <- sample.int(N, n_eff, replace = FALSE)
+    Gb <- G[idx, , drop = FALSE]
+    yb <- simulate_trait_gaussian(Gb, qtl_index, beta, h2 = 0.2)
+    res <- single_marker_scan(Gb, yb)
+    out[b] <- any(res$p[qtl_index] < alpha_eff, na.rm = TRUE)
+  }
+  mean(out)
+}
+
+dpower_dn_fd <- function(n_vec, pwr_vec) {
+  n <- as.numeric(n_vec); p <- as.numeric(pwr_vec)
+  k <- length(n); d <- rep(NA_real_, k)
+  if (k >= 2) { d[1:(k-1)] <- diff(p)/pmax(1, diff(n)); d[k] <- d[k-1] }
+  d
+}
+
+solve_n_for_power <- function(G, qtl_index, beta, target = 0.8, n_min = 30, n_max = 1000,
+                              alpha = 0.05, alpha_method = "bonferroni", B = 150, seed = 123) {
+  lo <- n_min; hi <- n_max; best <- hi
+  while (lo <= hi) {
+    mid <- floor((lo + hi)/2)
+    p_mid <- power_simulate(G, qtl_index, beta, mid, B = B, alpha = alpha,
+                            alpha_method = alpha_method, seed = seed)
+    if (p_mid >= target) { best <- mid; hi <- mid - 1 } else { lo <- mid + 1 }
+  }
+  list(n = best,
+       power = power_simulate(G, qtl_index, beta, best, B = max(250,B),
+                              alpha = alpha, alpha_method = alpha_method, seed = seed))
+}
+
+# -----------------------------
+# QC & missing handling
+# -----------------------------
+compute_qc <- function(G) {
+  miss_mark <- colMeans(is.na(G))
+  miss_ind  <- rowMeans(is.na(G))
+  p_hat <- colMeans(G, na.rm = TRUE)/2
+  maf <- pmin(p_hat, 1 - p_hat)
+  list(miss_mark = miss_mark, miss_ind = miss_ind, maf = maf)
+}
+apply_filters <- function(G, max_miss_mark=0.1, max_miss_ind=0.1, maf_min=0.01) {
+  qc <- compute_qc(G)
+  keep_mark <- which(qc$miss_mark <= max_miss_mark & qc$maf >= maf_min & !is.na(qc$maf))
+  keep_ind  <- which(qc$miss_ind <= max_miss_ind)
+  if (length(keep_mark) == 0 || length(keep_ind) == 0) return(G[0,0,drop=FALSE])
+  G[keep_ind, keep_mark, drop = FALSE]
+}
+apply_missing_action <- function(G, mode = c("impute", "drop_rows_with_na", "drop_cols_with_na", "none")) {
+  mode <- match.arg(mode)
+  if (is.null(G)) return(G)
+  if (mode == "none") return(G)
+  if (mode == "drop_rows_with_na") return(G[rowSums(is.na(G)) == 0, , drop = FALSE])
+  if (mode == "drop_cols_with_na") return(G[, colSums(is.na(G)) == 0, drop = FALSE])
+  cm <- colMeans(G, na.rm = TRUE)
+  for (j in seq_len(ncol(G))) {
+    idx <- which(is.na(G[, j])); if (length(idx)) G[idx, j] <- cm[j]
+  }
+  G
+}
+
+# -----------------------------
+# UI
+# -----------------------------
+ui <- navbarPage(
+  title = "QTL Design Sandbox",
+  theme = shinytheme("flatly"),
+
+  tabPanel("Data",
+    sidebarLayout(
+      sidebarPanel(
+        numericInput("n_ind",  "Number of individuals (demo)", 400, min = 50, step = 50),
+        numericInput("m_mark", "Number of markers (demo)",     200, min = 50, step = 50),
+        sliderInput("maf", "MAF (demo)", min = 0.05, max = 0.5, value = 0.3, step = 0.01),
+        checkboxInput("demo_realistic", "Use realistic demo (subpop + LD + missingness)", TRUE),
+        actionButton("btn_gen", "Generate demo genotype"),
+        tags$hr(),
+        fileInput("geno_file", "Or upload genotype (CSV, 0/1/2)", accept = c(".csv")),
+        helpText("Format: rows = individuals, columns = markers; values = 0/1/2 (NA allowed)."),
+        tags$hr(),
+        h4("Missing-data handling"),
+        radioButtons("missing_mode", NULL,
+          c("Impute by column mean (recommended)" = "impute",
+            "Drop rows with any NA" = "drop_rows_with_na",
+            "Drop columns with any NA" = "drop_cols_with_na",
+            "Do nothing" = "none"), selected = "impute"),
+        actionButton("btn_missing_apply", "Apply missing-data handling"),
+        tags$hr(),
+        h4("QC Filters"),
+        sliderInput("f_miss_mark", "Marker missingness max (%)", min = 0, max = 50, value = 20, step = 1),
+        sliderInput("f_miss_ind",  "Individual missingness max (%)", min = 0, max = 50, value = 20, step = 1),
+        sliderInput("f_maf_min",   "MAF minimum", min = 0.0, max = 0.1, value = 0.01, step = 0.005),
+        checkboxInput("apply_filters_downstream", "Use filtered data for analysis", TRUE),
+        actionButton("btn_qc", "Run QC & Apply Filters"),
+        tags$hr(),
+        actionButton("btn_refs", "Show References")
+      ),
+      mainPanel(
+        h4("Data overview"),
+        DTOutput("geno_head"),
+        tags$hr(),
+        fluidRow(
+          column(6,
+            h4("Dimensions & MAF"),
+            verbatimTextOutput("dim_maf_summary"),
+            plotOutput("maf_hist", height = 220)
+          ),
+          column(6,
+            h4("Missingness"),
+            plotOutput("miss_mark_hist", height = 220),
+            plotOutput("miss_ind_hist", height = 220),
+            verbatimTextOutput("missing_action_summary")
+          )
+        ),
+        tags$hr(),
+        h4("QC Summary"),
+        verbatimTextOutput("qc_summary")
+      )
+    )
+  ),
+
+  tabPanel("Model",
+    sidebarLayout(
+      sidebarPanel(
+        selectInput("model_type", "Statistical model",
+          c("Single-marker (SIM)" = "sim", "LMM (placeholder)" = "lmm")),
+        numericInput("alpha", "Genome-wide significance α", 0.05, min = 1e-6, step = 0.01),
+        selectInput("alpha_method", "Multiple testing", c("bonferroni", "fdr")),
+        numericInput("rc2", "Covariate explained variance Rc^2", 0.0, min = 0, max = 0.9, step = 0.05),
+        tags$hr(),
+        numericInput("qtl_idx_model", "True QTL index (column)", 1, min = 1, step = 1),
+        numericInput("beta_eff_model", "QTL effect β (standardised)", 0.2, step = 0.05),
+        actionButton("btn_model_fit", "Run model analysis")
+      ),
+      mainPanel(
+        h4("Model analysis summary"),
+        verbatimTextOutput("model_summary"),
+        h4("t-distribution (df = n_eff − 2) with observed t"),
+        plotOutput("t_plot", height = 300)
+      )
+    )
+  ),
+
+  tabPanel("Power",
+    sidebarLayout(
+      sidebarPanel(
+        numericInput("qtl_idx", "True QTL index (column)", 1, min = 1, step = 1),
+        numericInput("beta_eff", "QTL effect β (standardised)", 0.2, step = 0.05),
+        sliderInput("n_grid", "Sample size grid", min = 50, max = 1000, value = c(100, 500), step = 50),
+        numericInput("grid_step", "Grid step", 50, min = 10, step = 10),
+        numericInput("B_sim", "Simulation repeats B", 200, min = 50, step = 50),
+        actionButton("btn_run", "Run power analysis")
+      ),
+      mainPanel(
+        h4("Analytic vs simulation power curves"),
+        plotOutput("power_plot"),
+        DTOutput("power_table")
+      )
+    )
+  ),
+
+  tabPanel("Derivative (dPower/dn)",
+    sidebarLayout(
+      sidebarPanel(
+        numericInput("deriv_thresh", "Stopping threshold (dPower/dn)", 0.005, step = 0.001),
+        helpText("When marginal gain falls below this threshold, suggest stopping additional sampling.")
+      ),
+      mainPanel(
+        h4("dPower/dn curve"),
+        plotOutput("deriv_plot"),
+        verbatimTextOutput("stop_msg")
+      )
+    )
+  ),
+
+  tabPanel("Solver",
+    sidebarLayout(
+      sidebarPanel(
+        numericInput("target_power", "Target power", 0.8, min = 0.5, max = 0.99, step = 0.01),
+        numericInput("solve_min", "Min n", 50, min = 30),
+        numericInput("solve_max", "Max n", 1000, min = 100),
+        numericInput("B_solve", "Simulation repeats (solver)", 150, min = 50),
+        actionButton("btn_solve", "Solve n*")
+      ),
+      mainPanel(
+        h4("Sample size inversion"),
+        verbatimTextOutput("solve_text")
+      )
+    )
+  ),
+
+  tabPanel("Report",
+    sidebarLayout(
+      sidebarPanel(
+        textInput("proj_name", "Project name", "QTL_Design_Run"),
+        downloadButton("dl_report", "Download parameter summary (txt)")
+      ),
+      mainPanel(
+        h4("Export contents"),
+        p("Export includes: key parameters, analytic/simulation highlights, dPower/dn threshold & suggestions.")
+      )
+    )
+  )
+)
+
+# -----------------------------
+# SERVER
+# -----------------------------
+server <- function(input, output, session) {
+
+  G_raw  <- reactiveVal(NULL)
+  G_filt <- reactiveVal(NULL)
+  G_step_missing <- reactiveVal(NULL)
+
+  fallback_demo <- reactive({
+    genotype_sim_realistic(n = 200, m = 400, seed = 1)
+  })
+
+  # Robust active matrix (fallback to demo when empty)
+  G_active <- reactive({
+    Gcand <- if (isTRUE(input$apply_filters_downstream) && !is.null(G_filt())) {
+      G_filt()
+    } else if (!is.null(G_step_missing())) {
+      G_step_missing()
+    } else if (!is.null(G_raw())) {
+      G_raw()
+    } else {
+      NULL
+    }
+    if (is.null(Gcand) || nrow(Gcand) < 2 || ncol(Gcand) < 1) return(fallback_demo())
+    Gcand
+  })
+
+  # --- Data events ---
+  observeEvent(input$btn_gen, {
+    if (isTRUE(input$demo_realistic)) {
+      G <- genotype_sim_realistic(n = input$n_ind, m = input$m_mark, maf_center = input$maf, seed = 1)
+    } else {
+      G <- genotype_sim(n = input$n_ind, m = input$m_mark, maf = input$maf)
+    }
+    G_raw(G); G_step_missing(NULL); G_filt(NULL)
+  }, ignoreInit = TRUE)
+
+  observeEvent(input$geno_file, {
+    req(input$geno_file)
+    df <- fread(input$geno_file$datapath)
+    G  <- as.matrix(df)
+    if (!all(G %in% c(0,1,2, NA))) {
+      showNotification("Non 0/1/2 encoding detected; please use additive 0/1/2 coding (NA allowed).", type = "error")
+      return(NULL)
+    }
+    G_raw(G); G_step_missing(NULL); G_filt(NULL)
+  }, ignoreInit = TRUE)
+
+  observeEvent(input$btn_missing_apply, {
+    G0 <- G_raw()
+    if (is.null(G0)) { showNotification("No raw genotype available. Use demo or upload.", type = "warning"); return(NULL) }
+    G1 <- apply_missing_action(G0, mode = input$missing_mode)
+    G_step_missing(G1); G_filt(NULL)
+  }, ignoreInit = TRUE)
+
+  qc_results <- eventReactive(input$btn_qc, {
+    G0 <- if (!is.null(G_step_missing())) G_step_missing() else G_raw()
+    if (is.null(G0)) G0 <- fallback_demo()
+    qc0 <- compute_qc(G0)
+    G1 <- apply_filters(G0, max_miss_mark = input$f_miss_mark/100,
+                             max_miss_ind  = input$f_miss_ind/100,
+                             maf_min       = input$f_maf_min)
+    qc1 <- compute_qc(G1)
+    G_filt(G1)
+    list(G0=G0, qc0=qc0, G1=G1, qc1=qc1)
+  }, ignoreInit = TRUE)
+
+  # --- Data outputs ---
+  output$geno_head <- renderDT({
+    G <- if(!is.null(G_raw())) G_raw() else fallback_demo()
+    datatable(as.data.table(G[1:min(10, nrow(G)), 1:min(10, ncol(G))]), options = list(scrollX = TRUE))
+  })
+
+  output$dim_maf_summary <- renderText({
+    G0 <- if(!is.null(G_raw())) G_raw() else fallback_demo()
+    qc0 <- compute_qc(G0)
+    txt <- glue("Raw (or fallback): N x M = {nrow(G0)} x {ncol(G0)} | Median MAF = {round(median(qc0$maf, na.rm=TRUE),3)}")
+    if (!is.null(G_step_missing())) {
+      Gm <- G_step_missing(); qcm <- compute_qc(Gm)
+      txt <- paste0(txt, "\n", glue("After missing-handling: N x M = {nrow(Gm)} x {ncol(Gm)} | Median MAF = {round(median(qcm$maf, na.rm=TRUE),3)}"))
+    }
+    if (!is.null(G_filt())) {
+      G1 <- G_filt(); qc1 <- compute_qc(G1)
+      txt <- paste0(txt, "\n", glue("Filtered: N x M = {nrow(G1)} x {ncol(G1)} | Median MAF = {round(median(qc1$maf, na.rm=TRUE),3)}"))
+    }
+    txt
+  })
+
+  output$maf_hist <- renderPlot({
+    G <- if(!is.null(G_raw())) G_raw() else fallback_demo()
+    df <- data.frame(MAF = compute_qc(G)$maf)
+    ggplot(df, aes(MAF)) + geom_histogram(bins = 40, na.rm = TRUE) +
+      theme_minimal() + labs(title="MAF distribution (raw)", x="MAF", y="Count")
+  })
+
+  output$miss_mark_hist <- renderPlot({
+    G <- if(!is.null(G_raw())) G_raw() else fallback_demo()
+    df <- data.frame(miss = compute_qc(G)$miss_mark * 100)
+    ggplot(df, aes(miss)) + geom_histogram(bins = 40, na.rm = TRUE) +
+      theme_minimal() + labs(title="Marker missingness (%)", x="%", y="Count")
+  })
+
+  output$miss_ind_hist <- renderPlot({
+    G <- if(!is.null(G_raw())) G_raw() else fallback_demo()
+    df <- data.frame(miss = compute_qc(G)$miss_ind * 100)
+    ggplot(df, aes(miss)) + geom_histogram(bins = 40, na.rm = TRUE) +
+      theme_minimal() + labs(title="Individual missingness (%)", x="%", y="Count")
+  })
+
+  output$missing_action_summary <- renderText({
+    if (is.null(G_raw())) return("Missing-data handling: waiting for raw genotype (or use demo).")
+    mode <- switch(input$missing_mode,
+                   impute = "Impute by column mean",
+                   drop_rows_with_na = "Drop rows with any NA",
+                   drop_cols_with_na = "Drop columns with any NA",
+                   none = "Do nothing")
+    glue("Selected missing-data handling: {mode}. Click 'Apply' to effect.")
+  })
+
+  output$qc_summary <- renderText({
+    G0 <- if(!is.null(G_raw())) G_raw() else fallback_demo()
+    qc0 <- compute_qc(G0)
+    msg <- c(glue("Raw (or fallback): N x M = {nrow(G0)} x {ncol(G0)}; median MAF = {round(median(qc0$maf,na.rm=TRUE),3)};"),
+             glue("Low-diversity markers (MAF<0.05): {round(mean(qc0$maf<0.05, na.rm=TRUE),3)}"))
+    if (!is.null(G_filt())) {
+      G1 <- G_filt(); qc1 <- compute_qc(G1)
+      msg <- c(msg,
+        glue("Filtered: N x M = {nrow(G1)} x {ncol(G1)}; median MAF = {round(median(qc1$maf,na.rm=TRUE),3)};"),
+        glue("Low-diversity markers (MAF<0.05): {round(mean(qc1$maf<0.05, na.rm=TRUE),3)}"),
+        glue("Bonferroni alpha/M: {input$alpha}/{ncol(G0)} -> {input$alpha}/{ncol(G1)}")
+      )
+    }
+    paste(msg, collapse = "\n")
+  })
+
+  # ---------------- Model page (safe for realistic demo with NA) ----------------
+  model_fit_res <- eventReactive(input$btn_model_fit, {
+    G <- G_active()
+    qidx <- safe_index(input$qtl_idx_model, ncol(G), default = 1L)
+
+    # mean-impute the chosen QTL column to avoid NA in simulate_trait_gaussian
+    G_use <- G
+    cm <- mean(G_use[, qidx], na.rm = TRUE); if (!is.finite(cm)) cm <- 0
+    na_rows <- which(is.na(G_use[, qidx])); if (length(na_rows)) G_use[na_rows, qidx] <- cm
+
+    beta <- input$beta_eff_model
+    y <- simulate_trait_gaussian(G_use, qtl_index = qidx, beta = beta, h2 = 0.2, seed = 123)
+
+    scan <- single_marker_scan(G_use, y)
+    list(G = G_use, y = y, scan = scan, qidx = qidx)
+  }, ignoreInit = TRUE)
+
+  output$model_summary <- renderText({
+    res <- model_fit_res()
+    G <- res$G; qidx <- res$qidx; p <- res$scan$p; tstats <- res$scan$t
+    alpha_eff <- effective_alpha(input$alpha, ncol(G), input$alpha_method)
+    passed <- isTRUE(p[qidx] < alpha_eff)
+    p_show <- if (is.finite(p[qidx])) signif(p[qidx], 3) else NA
+    t_show <- if (is.finite(tstats[qidx])) round(tstats[qidx], 3) else NA
+    glue("Model: {input$model_type}; alpha={input$alpha} ({input$alpha_method}), effective alpha={signif(alpha_eff,3)}\n",
+         "N x M = {nrow(G)} x {ncol(G)}; selected marker = {qidx}\n",
+         "Observed t = {t_show}, p = {p_show}; ",
+         if (passed) 'PASS genome-wide threshold' else 'NOT significant at genome-wide level')
+  })
+
+  output$t_plot <- renderPlot({
+    res <- model_fit_res()
+    cc <- complete.cases(res$y, res$G[, res$qidx])
+    n_eff <- sum(cc); df <- max(1, n_eff - 2)
+    alpha_eff <- effective_alpha(input$alpha, ncol(res$G), input$alpha_method)
+    alpha_eff <- min(max(alpha_eff, 1e-12), 0.999999)
+    tcrit <- qt(1 - alpha_eff/2, df = df)
+    t_obs <- res$scan$t[res$qidx]; if (!is.finite(t_obs)) t_obs <- 0
+    xs <- seq(-4*max(1,abs(tcrit)), 4*max(1,abs(tcrit)), length.out = 1000)
+    dens <- dt(xs, df = df)
+    ggplot(data.frame(x=xs, y=dens), aes(x,y)) +
+      geom_line() +
+      geom_vline(xintercept = c(-tcrit, tcrit), linetype = "dashed") +
+      geom_vline(xintercept = t_obs, linetype = "solid") +
+      theme_minimal() +
+      labs(title = glue("t-distribution (df={df}); dashed=±t_crit, solid=t_obs"),
+           x = "t", y = "density")
+  })
+
+  # ---------------- Power page (robust with safe helpers) ----------------
+  power_df <- eventReactive(input$btn_run, {
+    G <- G_active(); req(G)
+
+    M <- ncol(G); N <- nrow(G)
+    qidx <- safe_index(input$qtl_idx, M, default = 1L)
+
+    beta  <- input$beta_eff
+    alpha <- input$alpha
+    method <- input$alpha_method
+    rc2 <- input$rc2
+
+    n_range <- safe_n_grid(input$n_grid, input$grid_step, N)
+
+    alpha_eff <- effective_alpha(alpha, M, method)
+
+    if (M >= 1) {
+      p_hat <- mean(colMeans(G, na.rm = TRUE) / 2)
+      maf <- pmin(p_hat, 1 - p_hat)
+      if (!is.finite(maf) || maf <= 0) maf <- 0.25
+    } else {
+      maf <- 0.25
+    }
+
+    pwr_a <- sapply(n_range, function(n)
+      power_analytic_single_marker(n, beta, maf, alpha_eff, rc2 = rc2, sigma2 = 1))
+
+    B <- input$B_sim
+    pwr_s <- sapply(n_range, function(n)
+      power_simulate(G, qtl_index = qidx, beta = beta, n = n, B = B,
+                     alpha = alpha, alpha_method = method))
+
+    data.frame(n = n_range, power_analytic = pwr_a, power_sim = pwr_s)
+  })
+
+  output$power_plot <- renderPlot({
+    df <- power_df(); req(df)
+    ggplot(df, aes(n)) +
+      geom_line(aes(y = power_analytic), linetype = "dashed") +
+      geom_point(aes(y = power_sim)) +
+      labs(y = "Power", title = "Analytic (dashed) vs Simulation (points)") +
+      theme_minimal()
+  })
+
+  output$power_table <- renderDT({
+    df <- power_df(); req(df)
+    datatable(df, options = list(pageLength = 10))
+  })
+
+  # ---------------- Derivative ----------------
+  output$deriv_plot <- renderPlot({
+    df <- power_df(); req(df)
+    d <- dpower_dn_fd(df$n, df$power_sim)
+    ggplot(data.frame(n=df$n, dpower=d), aes(n, dpower)) +
+      geom_line() +
+      geom_hline(yintercept = input$deriv_thresh, linetype = "dotted") +
+      labs(y = "dPower/dn (finite diff)", title = "Marginal gain curve") +
+      theme_minimal()
+  })
+
+  output$stop_msg <- renderText({
+    df <- power_df(); req(df)
+    d <- dpower_dn_fd(df$n, df$power_sim)
+    below <- which(d <= input$deriv_thresh)
+    if (length(below) == 0) "No stopping threshold triggered within the current grid."
+    else glue("Suggested stopping point: n ≈ {df$n[min(below)]} (dPower/dn ≤ {input$deriv_thresh})")
+  })
+
+  # ---------------- Solver (use safe_index) ----------------
+  solve_res <- eventReactive(input$btn_solve, {
+    G <- G_active(); req(G)
+    qidx <- safe_index(input$qtl_idx, ncol(G), default = 1L)
+    solve_n_for_power(G, qtl_index = qidx, beta = input$beta_eff,
+                      target = input$target_power,
+                      n_min = input$solve_min, n_max = input$solve_max,
+                      alpha = input$alpha, alpha_method = input$alpha_method,
+                      B = input$B_solve, seed = 321)
+  })
+
+  output$solve_text <- renderText({
+    res <- solve_res(); req(res)
+    glue("Minimum sample size n* = {res$n}\nSimulation-confirmed power ≈ {round(res$power,3)}")
+  })
+
+  # ---------------- Report ----------------
+  output$dl_report <- downloadHandler(
+    filename = function() paste0(input$proj_name, "_summary.txt"),
+    content = function(file) {
+      G <- G_active()
+      txt <- c(
+        glue("Project: {input$proj_name}"),
+        glue("N x M: {nrow(G)} x {ncol(G)}"),
+        glue("Model: {input$model_type}, alpha={input$alpha}, mult={input$alpha_method}, Rc2={input$rc2}"),
+        glue("QTL idx={input$qtl_idx}, beta={input$beta_eff}"),
+        glue("n grid: {paste(seq(input$n_grid[1], input$n_grid[2], by = input$grid_step), collapse=', ')}"),
+        glue("B(sim)={input$B_sim}, dPower/dn stop={input$deriv_thresh}"),
+        glue("Target power={input$target_power} (solver bounds {input$solve_min}-{input$solve_max})")
+      )
+      writeLines(txt, con = file)
+    }
+  )
+
+  # References modal
+  observeEvent(input$btn_refs, {
+    dat <- data.frame(
+      Topic = c("Multiple testing (FDR)", "LMM for population structure"),
+      Citation = c("Benjamini & Hochberg (1995) JRSS-B", "Kang et al. (2010) EMMAX; Lippert et al. (2011) FaST-LMM"),
+      Link = c("https://doi.org/10.1111/j.2517-6161.1995.tb02031.x", "https://doi.org/10.1038/ng.548"),
+      stringsAsFactors = FALSE
+    )
+    showModal(modalDialog(
+      title = "References",
+      DTOutput("refs_table"),
+      easyClose = TRUE, size = "l", footer = NULL
+    ))
+    output$refs_table <- renderDT({
+      dat$Link <- sprintf("<a href='%s' target='_blank'>link</a>", dat$Link)
+      datatable(dat, escape = FALSE, options = list(pageLength = 10))
+    })
+  })
+}
+
+shinyApp(ui, server)
+
+```
+
+V3
+```{r}
+# app.R
+# QTL Design Sandbox (Shiny, robust Power tab + safe indices/grid + NA-safe simulation)
+# ----------------------------------------------------------------
+suppressPackageStartupMessages({
+  library(shiny); library(shinythemes)
+  library(data.table); library(DT); library(ggplot2)
+  library(MASS); library(stats); library(glue)
+  library(irlba)
+})
+
+# -----------------------------
+# Data simulators
+# -----------------------------
+genotype_sim <- function(n = 400, m = 200, maf = 0.3, seed = 1) {
+  set.seed(seed)
+  G <- matrix(rbinom(n * m, 2, maf), nrow = n, ncol = m)
+  colnames(G) <- paste0("M", seq_len(m))
+  G
+}
+
+genotype_sim_realistic <- function(n = 200, m = 400,
+                                   K = 3, maf_center = 0.30,
+                                   maf_walk_sd = 0.01, subpop_drift_sd = 0.05,
+                                   marker_hetero_sd = 0.02,
+                                   block_size = 10, copy_prob = 0.85, mutate_prob = 0.05,
+                                   mean_miss = 0.05, seed = 1) {
+  set.seed(seed)
+  sizes <- rep(floor(n / K), K); sizes[seq_len(n %% K)] <- sizes[seq_len(n %% K)] + 1
+  groups <- rep(seq_len(K), sizes); groups <- sample(groups)
+  p_base <- pmin(pmax(cumsum(rnorm(m, 0, maf_walk_sd)) + maf_center, 0.02), 0.98)
+  drift <- rnorm(K, 0, subpop_drift_sd)
+  p_sub <- sapply(drift, function(d) pmin(pmax(p_base + d, 0.02), 0.98))
+  p_sub <- t(p_sub) + matrix(rnorm(K * m, 0, marker_hetero_sd), nrow = K)
+  p_sub <- pmin(pmax(p_sub, 0.02), 0.98)
+  G <- matrix(NA_real_, nrow = n, ncol = m)
+  for (i in seq_len(n)) G[i, ] <- rbinom(m, 2, p_sub[groups[i], ])
+  for (start in seq(1, m, by = block_size)) {
+    end <- min(start + block_size - 1, m)
+    if (end > start) {
+      ref <- start
+      for (j in (ref + 1):end) {
+        mask <- runif(n) < copy_prob
+        G[mask, j] <- G[mask, ref]
+        flip <- runif(n) < mutate_prob
+        if (any(flip)) G[flip, j] <- rbinom(sum(flip), 2, p_base[j])
+      }
+    }
+  }
+  a <- 1.2; b <- max(a / max(1e-6, mean_miss) - a, 1.1)
+  miss_rate <- rbeta(m, a, b)
+  for (j in seq_len(m)) {
+    miss <- runif(n) < miss_rate[j]
+    if (any(miss)) G[miss, j] <- NA
+  }
+  colnames(G) <- paste0("M", seq_len(m))
+  G
+}
+
+# -----------------------------
+# Trait + association
+# -----------------------------
+# PATCH 1: NA-safe simulate_trait_gaussian (impute QTL column; guard variances)
+simulate_trait_gaussian <- function(G, qtl_index, beta, h2 = 0.2, rc2 = 0, seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  n <- nrow(G)
+  qtl_index <- max(1L, min(as.integer(qtl_index), ncol(G)))
+
+  # Mean-impute the chosen QTL column so g_eff has no NA
+  if (anyNA(G[, qtl_index])) {
+    cm <- mean(G[, qtl_index], na.rm = TRUE); if (!is.finite(cm)) cm <- 0
+    nas <- which(is.na(G[, qtl_index]))
+    if (length(nas)) G[nas, qtl_index] <- cm
+  }
+
+  g_eff <- as.numeric(G[, qtl_index, drop = FALSE] %*% beta)
+  var_g <- var(g_eff); if (!is.finite(var_g) || var_g < 1e-12) var_g <- 1e-12
+
+  # h2 = var_g / (var_g + sigma2_e)  ->  sigma2_e = var_g(1-h2)/h2
+  sigma2_e <- (var_g - h2 * var_g) / max(1e-12, h2)
+  if (!is.finite(sigma2_e) || sigma2_e <= 0) sigma2_e <- 1e-6
+
+  y <- scale(g_eff + rnorm(n, 0, sqrt(sigma2_e)), center = TRUE, scale = TRUE)[,1]
+  attr(y, "sigma2_e") <- sigma2_e
+  y
+}
+
+single_marker_scan <- function(G, y) {
+  # returns p-values and t-statistics per marker with NA-safe LM
+  nmark <- ncol(G)
+  pvals <- numeric(nmark); tstats <- numeric(nmark)
+  for (j in seq_len(nmark)) {
+    fit <- try(suppressWarnings(lm(y ~ G[, j], na.action = na.omit)), silent = TRUE)
+    if (inherits(fit, "try-error")) { pvals[j] <- NA_real_; tstats[j] <- NA_real_; next }
+    sm <- summary(fit)$coefficients
+    if (nrow(sm) >= 2) { pvals[j] <- sm[2,4]; tstats[j] <- sm[2,3] } else { pvals[j] <- NA_real_; tstats[j] <- NA_real_ }
+  }
+  list(p = pvals, t = tstats)
+}
+
+effective_alpha <- function(alpha, M, method = c("bonferroni","fdr")) {
+  # Robust to NULL/NA method
+  if (is.null(method) || length(method) == 0 || !is.finite(M)) method <- "bonferroni"
+  method <- tryCatch(match.arg(method), error = function(e) "bonferroni")
+  if (!is.finite(alpha) || alpha <= 0) alpha <- 0.05
+  if (!is.finite(M) || M < 1L) M <- 1L
+  if (identical(method, "bonferroni")) return(alpha / max(1, as.integer(M)))
+  alpha
+}
+
+power_analytic_single_marker <- function(n, beta, maf, alpha_eff, rc2 = 0, sigma2 = 1) {
+  vg <- 2 * maf * (1 - maf); if (vg < 1e-12) return(0)
+  lambda <- n * (beta^2) * vg / (sigma2 * (1 - rc2 + 1e-12))
+  z <- qnorm(1 - alpha_eff/2); m <- sqrt(lambda)
+  pwr <- pnorm(-z, mean = m, sd = 1) + (1 - pnorm(z, mean = m, sd = 1))
+  pmin(pmax(pwr, 0), 1)
+}
+
+# -----------------------------
+# SAFE HELPERS
+# -----------------------------
+safe_index <- function(idx, M, default = 1L) {
+  idx <- suppressWarnings(as.integer(idx))
+  if (is.na(idx) || !is.finite(M) || M < 1L) return(as.integer(default))
+  if (idx < 1L || idx > M) return(as.integer(default))
+  as.integer(idx)
+}
+
+safe_n_grid <- function(n_grid, step, N, fallback = NULL) {
+  n1 <- n_grid[1]; n2 <- n_grid[2]
+  if (!is.finite(n1)) n1 <- 100
+  if (!is.finite(n2)) n2 <- max(150, n1 + 50)
+  if (!is.finite(step) || step <= 0) step <- 50
+  xs <- seq(n1, n2, by = step)
+  xs <- xs[is.finite(xs)]
+  xs <- xs[xs >= 2 & xs <= N]
+  if (length(xs) == 0L) {
+    if (is.null(fallback)) xs <- pmin(max(2L, floor(N/2)), N) else xs <- fallback
+  }
+  as.integer(xs)
+}
+
+# -----------------------------
+# PATCH 2: Robust simulation (clamp n; column-mean imputation for Gb)
+# -----------------------------
+power_simulate <- function(G, qtl_index, beta, n, B = 200, alpha = 0.05,
+                           alpha_method = "bonferroni", seed = 1) {
+  set.seed(seed)
+  M <- ncol(G)
+  if (!is.finite(M) || M < 1L) return(0)  # no markers → 0 power
+  qtl_index <- safe_index(qtl_index, M, default = 1L)
+
+  alpha_eff <- effective_alpha(alpha, M, alpha_method)
+  out <- logical(B)
+  N <- nrow(G)
+  n_eff <- max(2L, min(as.integer(n), N))  # clamp to [2, N]
+
+  for (b in seq_len(B)) {
+    idx <- sample.int(N, n_eff, replace = FALSE)
+    Gb <- G[idx, , drop = FALSE]
+
+    # Column-mean imputation for sampled matrix (robust to NA anywhere)
+    if (anyNA(Gb)) {
+      cm <- colMeans(Gb, na.rm = TRUE)
+      for (j in seq_len(ncol(Gb))) {
+        nas <- which(is.na(Gb[, j]))
+        if (length(nas)) {
+          v <- cm[j]; if (!is.finite(v)) v <- 0
+          Gb[nas, j] <- v
+        }
+      }
+    }
+
+    yb <- simulate_trait_gaussian(Gb, qtl_index, beta, h2 = 0.2)
+    res <- single_marker_scan(Gb, yb)
+    out[b] <- any(res$p[qtl_index] < alpha_eff, na.rm = TRUE)
+  }
+  mean(out)
+}
+
+dpower_dn_fd <- function(n_vec, pwr_vec) {
+  n <- as.numeric(n_vec); p <- as.numeric(pwr_vec)
+  k <- length(n); d <- rep(NA_real_, k)
+  if (k >= 2) { d[1:(k-1)] <- diff(p)/pmax(1, diff(n)); d[k] <- d[k-1] }
+  d
+}
+
+solve_n_for_power <- function(G, qtl_index, beta, target = 0.8, n_min = 30, n_max = 1000,
+                              alpha = 0.05, alpha_method = "bonferroni", B = 150, seed = 123) {
+  lo <- n_min; hi <- n_max; best <- hi
+  while (lo <= hi) {
+    mid <- floor((lo + hi)/2)
+    p_mid <- power_simulate(G, qtl_index, beta, mid, B = B, alpha = alpha,
+                            alpha_method = alpha_method, seed = seed)
+    if (p_mid >= target) { best <- mid; hi <- mid - 1 } else { lo <- mid + 1 }
+  }
+  list(n = best,
+       power = power_simulate(G, qtl_index, beta, best, B = max(250,B),
+                              alpha = alpha, alpha_method = alpha_method, seed = seed))
+}
+
+# -----------------------------
+# QC & missing handling
+# -----------------------------
+compute_qc <- function(G) {
+  miss_mark <- colMeans(is.na(G))
+  miss_ind  <- rowMeans(is.na(G))
+  p_hat <- colMeans(G, na.rm = TRUE)/2
+  maf <- pmin(p_hat, 1 - p_hat)
+  list(miss_mark = miss_mark, miss_ind = miss_ind, maf = maf)
+}
+apply_filters <- function(G, max_miss_mark=0.1, max_miss_ind=0.1, maf_min=0.01) {
+  qc <- compute_qc(G)
+  keep_mark <- which(qc$miss_mark <= max_miss_mark & qc$maf >= maf_min & !is.na(qc$maf))
+  keep_ind  <- which(qc$miss_ind <= max_miss_ind)
+  if (length(keep_mark) == 0 || length(keep_ind) == 0) return(G[0,0,drop=FALSE])
+  G[keep_ind, keep_mark, drop = FALSE]
+}
+apply_missing_action <- function(G, mode = c("impute", "drop_rows_with_na", "drop_cols_with_na", "none")) {
+  mode <- match.arg(mode)
+  if (is.null(G)) return(G)
+  if (mode == "none") return(G)
+  if (mode == "drop_rows_with_na") return(G[rowSums(is.na(G)) == 0, , drop = FALSE])
+  if (mode == "drop_cols_with_na") return(G[, colSums(is.na(G)) == 0, drop = FALSE])
+  cm <- colMeans(G, na.rm = TRUE)
+  for (j in seq_len(ncol(G))) {
+    idx <- which(is.na(G[, j])); if (length(idx)) G[idx, j] <- cm[j]
+  }
+  G
+}
+
+# -----------------------------
+# UI
+# -----------------------------
+ui <- navbarPage(
+  title = "QTL Design Sandbox",
+  theme = shinytheme("flatly"),
+
+  tabPanel("Data",
+    sidebarLayout(
+      sidebarPanel(
+        numericInput("n_ind",  "Number of individuals (demo)", 400, min = 50, step = 50),
+        numericInput("m_mark", "Number of markers (demo)",     200, min = 50, step = 50),
+        sliderInput("maf", "MAF (demo)", min = 0.05, max = 0.5, value = 0.3, step = 0.01),
+        checkboxInput("demo_realistic", "Use realistic demo (subpop + LD + missingness)", TRUE),
+        actionButton("btn_gen", "Generate demo genotype"),
+        tags$hr(),
+        fileInput("geno_file", "Or upload genotype (CSV, 0/1/2)", accept = c(".csv")),
+        helpText("Format: rows = individuals, columns = markers; values = 0/1/2 (NA allowed)."),
+        tags$hr(),
+        h4("Missing-data handling"),
+        radioButtons("missing_mode", NULL,
+          c("Impute by column mean (recommended)" = "impute",
+            "Drop rows with any NA" = "drop_rows_with_na",
+            "Drop columns with any NA" = "drop_cols_with_na",
+            "Do nothing" = "none"), selected = "impute"),
+        actionButton("btn_missing_apply", "Apply missing-data handling"),
+        tags$hr(),
+        h4("QC Filters"),
+        sliderInput("f_miss_mark", "Marker missingness max (%)", min = 0, max = 50, value = 20, step = 1),
+        sliderInput("f_miss_ind",  "Individual missingness max (%)", min = 0, max = 50, value = 20, step = 1),
+        sliderInput("f_maf_min",   "MAF minimum", min = 0.0, max = 0.1, value = 0.01, step = 0.005),
+        checkboxInput("apply_filters_downstream", "Use filtered data for analysis", TRUE),
+        actionButton("btn_qc", "Run QC & Apply Filters"),
+        tags$hr(),
+        actionButton("btn_refs", "Show References")
+      ),
+      mainPanel(
+        h4("Data overview"),
+        DTOutput("geno_head"),
+        tags$hr(),
+        fluidRow(
+          column(6,
+            h4("Dimensions & MAF"),
+            verbatimTextOutput("dim_maf_summary"),
+            plotOutput("maf_hist", height = 220)
+          ),
+          column(6,
+            h4("Missingness"),
+            plotOutput("miss_mark_hist", height = 220),
+            plotOutput("miss_ind_hist", height = 220),
+            verbatimTextOutput("missing_action_summary")
+          )
+        ),
+        tags$hr(),
+        h4("QC Summary"),
+        verbatimTextOutput("qc_summary")
+      )
+    )
+  ),
+
+  tabPanel("Model",
+    sidebarLayout(
+      sidebarPanel(
+        selectInput("model_type", "Statistical model",
+          c("Single-marker (SIM)" = "sim", "LMM (placeholder)" = "lmm")),
+        numericInput("alpha", "Genome-wide significance α", 0.05, min = 1e-6, step = 0.01),
+        selectInput("alpha_method", "Multiple testing", c("bonferroni", "fdr")),
+        numericInput("rc2", "Covariate explained variance Rc^2", 0.0, min = 0, max = 0.9, step = 0.05),
+        tags$hr(),
+        numericInput("qtl_idx_model", "True QTL index (column)", 1, min = 1, step = 1),
+        numericInput("beta_eff_model", "QTL effect β (standardised)", 0.2, step = 0.05),
+        actionButton("btn_model_fit", "Run model analysis")
+      ),
+      mainPanel(
+        h4("Model analysis summary"),
+        verbatimTextOutput("model_summary"),
+        h4("t-distribution (df = n_eff − 2) with observed t"),
+        plotOutput("t_plot", height = 300)
+      )
+    )
+  ),
+
+  tabPanel("Power",
+    sidebarLayout(
+      sidebarPanel(
+        numericInput("qtl_idx", "True QTL index (column)", 1, min = 1, step = 1),
+        numericInput("beta_eff", "QTL effect β (standardised)", 0.2, step = 0.05),
+        sliderInput("n_grid", "Sample size grid", min = 50, max = 1000, value = c(100, 500), step = 50),
+        numericInput("grid_step", "Grid step", 50, min = 10, step = 10),
+        numericInput("B_sim", "Simulation repeats B", 200, min = 50, step = 50),
+        actionButton("btn_run", "Run power analysis")
+      ),
+      mainPanel(
+        h4("Analytic vs simulation power curves"),
+        plotOutput("power_plot"),
+        DTOutput("power_table")
+      )
+    )
+  ),
+
+  tabPanel("Derivative (dPower/dn)",
+    sidebarLayout(
+      sidebarPanel(
+        numericInput("deriv_thresh", "Stopping threshold (dPower/dn)", 0.005, step = 0.001),
+        helpText("When marginal gain falls below this threshold, suggest stopping additional sampling.")
+      ),
+      mainPanel(
+        h4("dPower/dn curve"),
+        plotOutput("deriv_plot"),
+        verbatimTextOutput("stop_msg")
+      )
+    )
+  ),
+
+  tabPanel("Solver",
+    sidebarLayout(
+      sidebarPanel(
+        numericInput("target_power", "Target power", 0.8, min = 0.5, max = 0.99, step = 0.01),
+        numericInput("solve_min", "Min n", 50, min = 30),
+        numericInput("solve_max", "Max n", 1000, min = 100),
+        numericInput("B_solve", "Simulation repeats (solver)", 150, min = 50),
+        actionButton("btn_solve", "Solve n*")
+      ),
+      mainPanel(
+        h4("Sample size inversion"),
+        verbatimTextOutput("solve_text")
+      )
+    )
+  ),
+
+  tabPanel("Report",
+    sidebarLayout(
+      sidebarPanel(
+        textInput("proj_name", "Project name", "QTL_Design_Run"),
+        downloadButton("dl_report", "Download parameter summary (txt)")
+      ),
+      mainPanel(
+        h4("Export contents"),
+        p("Export includes: key parameters, analytic/simulation highlights, dPower/dn threshold & suggestions.")
+      )
+    )
+  )
+)
+
+# -----------------------------
+# SERVER
+# -----------------------------
+server <- function(input, output, session) {
+
+  G_raw  <- reactiveVal(NULL)
+  G_filt <- reactiveVal(NULL)
+  G_step_missing <- reactiveVal(NULL)
+
+  fallback_demo <- reactive({
+    genotype_sim_realistic(n = 200, m = 400, seed = 1)
+  })
+
+  # Robust active matrix (fallback to demo when empty)
+  G_active <- reactive({
+    Gcand <- if (isTRUE(input$apply_filters_downstream) && !is.null(G_filt())) {
+      G_filt()
+    } else if (!is.null(G_step_missing())) {
+      G_step_missing()
+    } else if (!is.null(G_raw())) {
+      G_raw()
+    } else {
+      NULL
+    }
+    if (is.null(Gcand) || nrow(Gcand) < 2 || ncol(Gcand) < 1) return(fallback_demo())
+    Gcand
+  })
+
+  # --- Data events ---
+  observeEvent(input$btn_gen, {
+    if (isTRUE(input$demo_realistic)) {
+      G <- genotype_sim_realistic(n = input$n_ind, m = input$m_mark, maf_center = input$maf, seed = 1)
+    } else {
+      G <- genotype_sim(n = input$n_ind, m = input$m_mark, maf = input$maf)
+    }
+    G_raw(G); G_step_missing(NULL); G_filt(NULL)
+  }, ignoreInit = TRUE)
+
+  observeEvent(input$geno_file, {
+    req(input$geno_file)
+    df <- fread(input$geno_file$datapath)
+    G  <- as.matrix(df)
+    if (!all(G %in% c(0,1,2, NA))) {
+      showNotification("Non 0/1/2 encoding detected; please use additive 0/1/2 coding (NA allowed).", type = "error")
+      return(NULL)
+    }
+    G_raw(G); G_step_missing(NULL); G_filt(NULL)
+  }, ignoreInit = TRUE)
+
+  observeEvent(input$btn_missing_apply, {
+    G0 <- G_raw()
+    if (is.null(G0)) { showNotification("No raw genotype available. Use demo or upload.", type = "warning"); return(NULL) }
+    G1 <- apply_missing_action(G0, mode = input$missing_mode)
+    G_step_missing(G1); G_filt(NULL)
+  }, ignoreInit = TRUE)
+
+  qc_results <- eventReactive(input$btn_qc, {
+    G0 <- if (!is.null(G_step_missing())) G_step_missing() else G_raw()
+    if (is.null(G0)) G0 <- fallback_demo()
+    qc0 <- compute_qc(G0)
+    G1 <- apply_filters(G0, max_miss_mark = input$f_miss_mark/100,
+                             max_miss_ind  = input$f_miss_ind/100,
+                             maf_min       = input$f_maf_min)
+    qc1 <- compute_qc(G1)
+    G_filt(G1)
+    list(G0=G0, qc0=qc0, G1=G1, qc1=qc1)
+  }, ignoreInit = TRUE)
+
+  # --- Data outputs ---
+  output$geno_head <- renderDT({
+    G <- if(!is.null(G_raw())) G_raw() else fallback_demo()
+    datatable(as.data.table(G[1:min(10, nrow(G)), 1:min(10, ncol(G))]), options = list(scrollX = TRUE))
+  })
+
+  output$dim_maf_summary <- renderText({
+    G0 <- if(!is.null(G_raw())) G_raw() else fallback_demo()
+    qc0 <- compute_qc(G0)
+    txt <- glue("Raw (or fallback): N x M = {nrow(G0)} x {ncol(G0)} | Median MAF = {round(median(qc0$maf, na.rm=TRUE),3)}")
+    if (!is.null(G_step_missing())) {
+      Gm <- G_step_missing(); qcm <- compute_qc(Gm)
+      txt <- paste0(txt, "\n", glue("After missing-handling: N x M = {nrow(Gm)} x {ncol(Gm)} | Median MAF = {round(median(qcm$maf, na.rm=TRUE),3)}"))
+    }
+    if (!is.null(G_filt())) {
+      G1 <- G_filt(); qc1 <- compute_qc(G1)
+      txt <- paste0(txt, "\n", glue("Filtered: N x M = {nrow(G1)} x {ncol(G1)} | Median MAF = {round(median(qc1$maf, na.rm=TRUE),3)}"))
+    }
+    txt
+  })
+
+  output$maf_hist <- renderPlot({
+    G <- if(!is.null(G_raw())) G_raw() else fallback_demo()
+    df <- data.frame(MAF = compute_qc(G)$maf)
+    ggplot(df, aes(MAF)) + geom_histogram(bins = 40, na.rm = TRUE) +
+      theme_minimal() + labs(title="MAF distribution (raw)", x="MAF", y="Count")
+  })
+
+  output$miss_mark_hist <- renderPlot({
+    G <- if(!is.null(G_raw())) G_raw() else fallback_demo()
+    df <- data.frame(miss = compute_qc(G)$miss_mark * 100)
+    ggplot(df, aes(miss)) + geom_histogram(bins = 40, na.rm = TRUE) +
+      theme_minimal() + labs(title="Marker missingness (%)", x="%", y="Count")
+  })
+
+  output$miss_ind_hist <- renderPlot({
+    G <- if(!is.null(G_raw())) G_raw() else fallback_demo()
+    df <- data.frame(miss = compute_qc(G)$miss_ind * 100)
+    ggplot(df, aes(miss)) + geom_histogram(bins = 40, na.rm = TRUE) +
+      theme_minimal() + labs(title="Individual missingness (%)", x="%", y="Count")
+  })
+
+  output$missing_action_summary <- renderText({
+    if (is.null(G_raw())) return("Missing-data handling: waiting for raw genotype (or use demo).")
+    mode <- switch(input$missing_mode,
+                   impute = "Impute by column mean",
+                   drop_rows_with_na = "Drop rows with any NA",
+                   drop_cols_with_na = "Drop columns with any NA",
+                   none = "Do nothing")
+    glue("Selected missing-data handling: {mode}. Click 'Apply' to effect.")
+  })
+
+  output$qc_summary <- renderText({
+    G0 <- if(!is.null(G_raw())) G_raw() else fallback_demo()
+    qc0 <- compute_qc(G0)
+    msg <- c(glue("Raw (or fallback): N x M = {nrow(G0)} x {ncol(G0)}; median MAF = {round(median(qc0$maf,na.rm=TRUE),3)};"),
+             glue("Low-diversity markers (MAF<0.05): {round(mean(qc0$maf<0.05, na.rm=TRUE),3)}"))
+    if (!is.null(G_filt())) {
+      G1 <- G_filt(); qc1 <- compute_qc(G1)
+      msg <- c(msg,
+        glue("Filtered: N x M = {nrow(G1)} x {ncol(G1)}; median MAF = {round(median(qc1$maf,na.rm=TRUE),3)};"),
+        glue("Low-diversity markers (MAF<0.05): {round(mean(qc1$maf<0.05, na.rm=TRUE),3)}"),
+        glue("Bonferroni alpha/M: {input$alpha}/{ncol(G0)} -> {input$alpha}/{ncol(G1)}")
+      )
+    }
+    paste(msg, collapse = "\n")
+  })
+
+  # ---------------- Model page ----------------
+  model_fit_res <- eventReactive(input$btn_model_fit, {
+    G <- G_active()
+    qidx <- safe_index(input$qtl_idx_model, ncol(G), default = 1L)
+
+    # mean-impute the chosen QTL column to avoid NA in simulate_trait_gaussian
+    G_use <- G
+    cm <- mean(G_use[, qidx], na.rm = TRUE); if (!is.finite(cm)) cm <- 0
+    na_rows <- which(is.na(G_use[, qidx])); if (length(na_rows)) G_use[na_rows, qidx] <- cm
+
+    beta <- input$beta_eff_model
+    y <- simulate_trait_gaussian(G_use, qtl_index = qidx, beta = beta, h2 = 0.2, seed = 123)
+
+    scan <- single_marker_scan(G_use, y)
+    list(G = G_use, y = y, scan = scan, qidx = qidx)
+  }, ignoreInit = TRUE)
+
+  output$model_summary <- renderText({
+    res <- model_fit_res()
+    G <- res$G; qidx <- res$qidx; p <- res$scan$p; tstats <- res$scan$t
+    alpha_eff <- effective_alpha(input$alpha, ncol(G), input$alpha_method)
+    passed <- isTRUE(p[qidx] < alpha_eff)
+    p_show <- if (is.finite(p[qidx])) signif(p[qidx], 3) else NA
+    t_show <- if (is.finite(tstats[qidx])) round(tstats[qidx], 3) else NA
+    glue("Model: {input$model_type}; alpha={input$alpha} ({input$alpha_method}), effective alpha={signif(alpha_eff,3)}\n",
+         "N x M = {nrow(G)} x {ncol(G)}; selected marker = {qidx}\n",
+         "Observed t = {t_show}, p = {p_show}; ",
+         if (passed) 'PASS genome-wide threshold' else 'NOT significant at genome-wide level')
+  })
+
+  output$t_plot <- renderPlot({
+    res <- model_fit_res()
+    cc <- complete.cases(res$y, res$G[, res$qidx])
+    n_eff <- sum(cc); df <- max(1, n_eff - 2)
+    alpha_eff <- effective_alpha(input$alpha, ncol(res$G), input$alpha_method)
+    alpha_eff <- min(max(alpha_eff, 1e-12), 0.999999)
+    tcrit <- qt(1 - alpha_eff/2, df = df)
+    t_obs <- res$scan$t[res$qidx]; if (!is.finite(t_obs)) t_obs <- 0
+    xs <- seq(-4*max(1,abs(tcrit)), 4*max(1,abs(tcrit)), length.out = 1000)
+    dens <- dt(xs, df = df)
+    ggplot(data.frame(x=xs, y=dens), aes(x,y)) +
+      geom_line() +
+      geom_vline(xintercept = c(-tcrit, tcrit), linetype = "dashed") +
+      geom_vline(xintercept = t_obs, linetype = "solid") +
+      theme_minimal() +
+      labs(title = glue("t-distribution (df={df}); dashed=±t_crit, solid=t_obs"),
+           x = "t", y = "density")
+  })
+
+  # ---------------- Power page (robust with safe helpers) ----------------
+  power_df <- eventReactive(input$btn_run, {
+    tryCatch({
+      G <- G_active(); req(G)
+
+      M <- ncol(G); N <- nrow(G)
+      qidx <- safe_index(input$qtl_idx, M, default = 1L)
+      n_range <- safe_n_grid(input$n_grid, input$grid_step, N)
+
+      beta  <- if (is.finite(input$beta_eff)) input$beta_eff else 0.2
+      alpha <- if (is.finite(input$alpha)) input$alpha else 0.05
+      method <- if (is.null(input$alpha_method)) "bonferroni" else input$alpha_method
+      rc2 <- if (is.finite(input$rc2)) input$rc2 else 0
+
+      alpha_eff <- effective_alpha(alpha, M, method)
+
+      # Robust maf (fallback to 0.25)
+      if (M >= 1) {
+        p_hat <- mean(colMeans(G, na.rm = TRUE) / 2)
+        maf <- pmin(p_hat, 1 - p_hat)
+        if (!is.finite(maf) || maf <= 0) maf <- 0.25
+      } else {
+        maf <- 0.25
+      }
+
+      pwr_a <- sapply(n_range, function(n)
+        power_analytic_single_marker(n, beta, maf, alpha_eff, rc2 = rc2, sigma2 = 1))
+
+      B <- if (is.finite(input$B_sim)) input$B_sim else 200
+      pwr_s <- sapply(n_range, function(n)
+        power_simulate(G, qtl_index = qidx, beta = beta, n = n, B = B,
+                       alpha = alpha, alpha_method = method))
+
+      data.frame(n = n_range, power_analytic = pwr_a, power_sim = pwr_s)
+    }, error = function(e) {
+      showNotification(paste("Power analysis failed:", conditionMessage(e)),
+                       type = "error", duration = 8)
+      data.frame(n = integer(0), power_analytic = numeric(0), power_sim = numeric(0))
+    })
+  })
+
+  output$power_plot <- renderPlot({
+    df <- power_df()
+    if (nrow(df) == 0) {
+      plot.new(); title("Power analysis did not return data.\nCheck Data/QC settings or try demo.")
+      return(invisible())
+    }
+    ggplot(df, aes(n)) +
+      geom_line(aes(y = power_analytic), linetype = "dashed") +
+      geom_point(aes(y = power_sim)) +
+      labs(y = "Power", title = "Analytic (dashed) vs Simulation (points)") +
+      theme_minimal()
+  })
+
+  output$power_table <- renderDT({
+    df <- power_df()
+    if (nrow(df) == 0) {
+      return(datatable(data.frame(Note = "No power results. Adjust inputs and click Run."),
+                       options = list(dom='t')))
+    }
+    datatable(df, options = list(pageLength = 10))
+  })
+
+  # ---------------- Derivative ----------------
+  output$deriv_plot <- renderPlot({
+    df <- power_df(); req(df)
+    d <- dpower_dn_fd(df$n, df$power_sim)
+    ggplot(data.frame(n=df$n, dpower=d), aes(n, dpower)) +
+      geom_line() +
+      geom_hline(yintercept = input$deriv_thresh, linetype = "dotted") +
+      labs(y = "dPower/dn (finite diff)", title = "Marginal gain curve") +
+      theme_minimal()
+  })
+
+  output$stop_msg <- renderText({
+    df <- power_df(); req(df)
+    d <- dpower_dn_fd(df$n, df$power_sim)
+    below <- which(d <= input$deriv_thresh)
+    if (length(below) == 0) "No stopping threshold triggered within the current grid."
+    else glue("Suggested stopping point: n ≈ {df$n[min(below)]} (dPower/dn ≤ {input$deriv_thresh})")
+  })
+
+  # ---------------- Solver (safe_index + tryCatch) ----------------
+  solve_res <- eventReactive(input$btn_solve, {
+    tryCatch({
+      G <- G_active(); req(G)
+      qidx <- safe_index(input$qtl_idx, ncol(G), default = 1L)
+      solve_n_for_power(G, qtl_index = qidx, beta = input$beta_eff,
+                        target = input$target_power,
+                        n_min = input$solve_min, n_max = input$solve_max,
+                        alpha = input$alpha, alpha_method = input$alpha_method,
+                        B = input$B_solve, seed = 321)
+    }, error = function(e) {
+      showNotification(paste("Solver failed:", conditionMessage(e)),
+                       type = "error", duration = 8)
+      list(n = NA_integer_, power = NA_real_)
+    })
+  })
+
+  output$solve_text <- renderText({
+    res <- solve_res(); req(res)
+    glue("Minimum sample size n* = {res$n}\nSimulation-confirmed power ≈ {round(res$power,3)}")
+  })
+
+  # ---------------- Report ----------------
+  output$dl_report <- downloadHandler(
+    filename = function() paste0(input$proj_name, "_summary.txt"),
+    content = function(file) {
+      G <- G_active()
+      txt <- c(
+        glue("Project: {input$proj_name}"),
+        glue("N x M: {nrow(G)} x {ncol(G)}"),
+        glue("Model: {input$model_type}, alpha={input$alpha}, mult={input$alpha_method}, Rc2={input$rc2}"),
+        glue("QTL idx={input$qtl_idx}, beta={input$beta_eff}"),
+        glue("n grid: {paste(seq(input$n_grid[1], input$n_grid[2], by = input$grid_step), collapse=', ')}"),
+        glue("B(sim)={input$B_sim}, dPower/dn stop={input$deriv_thresh}"),
+        glue("Target power={input$target_power} (solver bounds {input$solve_min}-{input$solve_max})")
+      )
+      writeLines(txt, con = file)
+    }
+  )
+
+  # References modal
+  observeEvent(input$btn_refs, {
+    dat <- data.frame(
+      Topic = c("Multiple testing (FDR)", "LMM for population structure"),
+      Citation = c("Benjamini & Hochberg (1995) JRSS-B", "Kang et al. (2010) EMMAX; Lippert et al. (2011) FaST-LMM"),
+      Link = c("https://doi.org/10.1111/j.2517-6161.1995.tb02031.x", "https://doi.org/10.1038/ng.548"),
+      stringsAsFactors = FALSE
+    )
+    showModal(modalDialog(
+      title = "References",
+      DTOutput("refs_table"),
+      easyClose = TRUE, size = "l", footer = NULL
+    ))
+    output$refs_table <- renderDT({
+      dat$Link <- sprintf("<a href='%s' target='_blank'>link</a>", dat$Link)
+      datatable(dat, escape = FALSE, options = list(pageLength = 10))
+    })
+  })
+}
+
+shinyApp(ui, server)
+
+```
+V4
+```{r}
+# app.R
+# QTL Design Sandbox (Shiny, robust Power tab + safe indices/grid + NA-safe simulation + fast-sim toggle)
+# ----------------------------------------------------------------
+suppressPackageStartupMessages({
+  library(shiny); library(shinythemes)
+  library(data.table); library(DT); library(ggplot2)
+  library(MASS); library(stats); library(glue)
+  library(irlba)
+})
+
+# -----------------------------
+# Data simulators
+# -----------------------------
+genotype_sim <- function(n = 400, m = 200, maf = 0.3, seed = 1) {
+  set.seed(seed)
+  G <- matrix(rbinom(n * m, 2, maf), nrow = n, ncol = m)
+  colnames(G) <- paste0("M", seq_len(m))
+  G
+}
+
+genotype_sim_realistic <- function(n = 200, m = 400,
+                                   K = 3, maf_center = 0.30,
+                                   maf_walk_sd = 0.01, subpop_drift_sd = 0.05,
+                                   marker_hetero_sd = 0.02,
+                                   block_size = 10, copy_prob = 0.85, mutate_prob = 0.05,
+                                   mean_miss = 0.05, seed = 1) {
+  set.seed(seed)
+  sizes <- rep(floor(n / K), K); sizes[seq_len(n %% K)] <- sizes[seq_len(n %% K)] + 1
+  groups <- rep(seq_len(K), sizes); groups <- sample(groups)
+  p_base <- pmin(pmax(cumsum(rnorm(m, 0, maf_walk_sd)) + maf_center, 0.02), 0.98)
+  drift <- rnorm(K, 0, subpop_drift_sd)
+  p_sub <- sapply(drift, function(d) pmin(pmax(p_base + d, 0.02), 0.98))
+  p_sub <- t(p_sub) + matrix(rnorm(K * m, 0, marker_hetero_sd), nrow = K)
+  p_sub <- pmin(pmax(p_sub, 0.02), 0.98)
+  G <- matrix(NA_real_, nrow = n, ncol = m)
+  for (i in seq_len(n)) G[i, ] <- rbinom(m, 2, p_sub[groups[i], ])
+  for (start in seq(1, m, by = block_size)) {
+    end <- min(start + block_size - 1, m)
+    if (end > start) {
+      ref <- start
+      for (j in (ref + 1):end) {
+        mask <- runif(n) < copy_prob
+        G[mask, j] <- G[mask, ref]
+        flip <- runif(n) < mutate_prob
+        if (any(flip)) G[flip, j] <- rbinom(sum(flip), 2, p_base[j])
+      }
+    }
+  }
+  a <- 1.2; b <- max(a / max(1e-6, mean_miss) - a, 1.1)
+  miss_rate <- rbeta(m, a, b)
+  for (j in seq_len(m)) {
+    miss <- runif(n) < miss_rate[j]
+    if (any(miss)) G[miss, j] <- NA
+  }
+  colnames(G) <- paste0("M", seq_len(m))
+  G
+}
+
+# -----------------------------
+# Trait + association
+# -----------------------------
+# NA-safe simulate_trait_gaussian (impute QTL column; guard variances)
+simulate_trait_gaussian <- function(G, qtl_index, beta, h2 = 0.2, rc2 = 0, seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  n <- nrow(G)
+  qtl_index <- max(1L, min(as.integer(qtl_index), ncol(G)))
+
+  # Mean-impute the chosen QTL column so g_eff has no NA
+  if (anyNA(G[, qtl_index])) {
+    cm <- mean(G[, qtl_index], na.rm = TRUE); if (!is.finite(cm)) cm <- 0
+    nas <- which(is.na(G[, qtl_index]))
+    if (length(nas)) G[nas, qtl_index] <- cm
+  }
+
+  g_eff <- as.numeric(G[, qtl_index, drop = FALSE] %*% beta)
+  var_g <- var(g_eff); if (!is.finite(var_g) || var_g < 1e-12) var_g <- 1e-12
+
+  # h2 = var_g / (var_g + sigma2_e)  ->  sigma2_e = var_g(1-h2)/h2
+  sigma2_e <- (var_g - h2 * var_g) / max(1e-12, h2)
+  if (!is.finite(sigma2_e) || sigma2_e <= 0) sigma2_e <- 1e-6
+
+  y <- scale(g_eff + rnorm(n, 0, sqrt(sigma2_e)), center = TRUE, scale = TRUE)[,1]
+  attr(y, "sigma2_e") <- sigma2_e
+  y
+}
+
+single_marker_scan <- function(G, y) {
+  # returns p-values and t-statistics per marker with NA-safe LM
+  nmark <- ncol(G)
+  pvals <- numeric(nmark); tstats <- numeric(nmark)
+  for (j in seq_len(nmark)) {
+    fit <- try(suppressWarnings(lm(y ~ G[, j], na.action = na.omit)), silent = TRUE)
+    if (inherits(fit, "try-error")) { pvals[j] <- NA_real_; tstats[j] <- NA_real_; next }
+    sm <- summary(fit)$coefficients
+    if (nrow(sm) >= 2) { pvals[j] <- sm[2,4]; tstats[j] <- sm[2,3] } else { pvals[j] <- NA_real_; tstats[j] <- NA_real_ }
+  }
+  list(p = pvals, t = tstats)
+}
+
+effective_alpha <- function(alpha, M, method = c("bonferroni","fdr")) {
+  # Robust to NULL/NA method
+  if (is.null(method) || length(method) == 0 || !is.finite(M)) method <- "bonferroni"
+  method <- tryCatch(match.arg(method), error = function(e) "bonferroni")
+  if (!is.finite(alpha) || alpha <= 0) alpha <- 0.05
+  if (!is.finite(M) || M < 1L) M <- 1L
+  if (identical(method, "bonferroni")) return(alpha / max(1, as.integer(M)))
+  alpha
+}
+
+power_analytic_single_marker <- function(n, beta, maf, alpha_eff, rc2 = 0, sigma2 = 1) {
+  vg <- 2 * maf * (1 - maf); if (vg < 1e-12) return(0)
+  lambda <- n * (beta^2) * vg / (sigma2 * (1 - rc2 + 1e-12))
+  z <- qnorm(1 - alpha_eff/2); m <- sqrt(lambda)
+  pwr <- pnorm(-z, mean = m, sd = 1) + (1 - pnorm(z, mean = m, sd = 1))
+  pmin(pmax(pwr, 0), 1)
+}
+
+# -----------------------------
+# SAFE HELPERS
+# -----------------------------
+safe_index <- function(idx, M, default = 1L) {
+  idx <- suppressWarnings(as.integer(idx))
+  if (is.na(idx) || !is.finite(M) || M < 1L) return(as.integer(default))
+  if (idx < 1L || idx > M) return(as.integer(default))
+  as.integer(idx)
+}
+
+safe_n_grid <- function(n_grid, step, N, fallback = NULL) {
+  n1 <- n_grid[1]; n2 <- n_grid[2]
+  if (!is.finite(n1)) n1 <- 100
+  if (!is.finite(n2)) n2 <- max(150, n1 + 50)
+  if (!is.finite(step) || step <= 0) step <- 50
+  xs <- seq(n1, n2, by = step)
+  xs <- xs[is.finite(xs)]
+  xs <- xs[xs >= 2 & xs <= N]
+  if (length(xs) == 0L) {
+    if (is.null(fallback)) xs <- pmin(max(2L, floor(N/2)), N) else xs <- fallback
+  }
+  as.integer(xs)
+}
+
+# -----------------------------
+# Robust simulation (original; whole-genome scan with NA-safe imputation)
+# -----------------------------
+power_simulate <- function(G, qtl_index, beta, n, B = 200, alpha = 0.05,
+                           alpha_method = "bonferroni", seed = 1) {
+  set.seed(seed)
+  M <- ncol(G)
+  if (!is.finite(M) || M < 1L) return(0)  # no markers → 0 power
+  qtl_index <- safe_index(qtl_index, M, default = 1L)
+
+  alpha_eff <- effective_alpha(alpha, M, alpha_method)
+  out <- logical(B)
+  N <- nrow(G)
+  n_eff <- max(2L, min(as.integer(n), N))  # clamp to [2, N]
+
+  for (b in seq_len(B)) {
+    idx <- sample.int(N, n_eff, replace = FALSE)
+    Gb <- G[idx, , drop = FALSE]
+
+    # Column-mean imputation for sampled matrix (robust to NA anywhere)
+    if (anyNA(Gb)) {
+      cm <- colMeans(Gb, na.rm = TRUE)
+      for (j in seq_len(ncol(Gb))) {
+        nas <- which(is.na(Gb[, j]))
+        if (length(nas)) {
+          v <- cm[j]; if (!is.finite(v)) v <- 0
+          Gb[nas, j] <- v
+        }
+      }
+    }
+
+    yb <- simulate_trait_gaussian(Gb, qtl_index, beta, h2 = 0.2)
+    res <- single_marker_scan(Gb, yb)
+    out[b] <- any(res$p[qtl_index] < alpha_eff, na.rm = TRUE)
+  }
+  mean(out)
+}
+
+# -----------------------------
+# NEW: Fast simulation (QTL-only testing; big speedup)
+# -----------------------------
+power_simulate_qtl_only <- function(G, qtl_index, beta, n, B = 200, alpha = 0.05,
+                                    alpha_method = "bonferroni", seed = 1) {
+  set.seed(seed)
+  M <- ncol(G)
+  if (!is.finite(M) || M < 1L) return(0)
+  qtl_index <- safe_index(qtl_index, M, default = 1L)
+
+  alpha_eff <- effective_alpha(alpha, M, alpha_method)
+  N <- nrow(G)
+  n_eff <- max(2L, min(as.integer(n), N))
+  hit <- 0L
+
+  for (b in seq_len(B)) {
+    idx <- sample.int(N, n_eff, replace = FALSE)
+    Gb <- G[idx, qtl_index, drop = FALSE]
+
+    # impute THIS marker only
+    if (anyNA(Gb[, 1])) {
+      v <- mean(Gb[, 1], na.rm = TRUE); if (!is.finite(v)) v <- 0
+      nas <- which(is.na(Gb[, 1])); if (length(nas)) Gb[nas, 1] <- v
+    }
+
+    yb <- simulate_trait_gaussian(cbind(Gb), qtl_index = 1L, beta = beta, h2 = 0.2)
+    fit <- suppressWarnings(try(lm(yb ~ Gb[, 1], na.action = na.omit), silent = TRUE))
+    if (!inherits(fit, "try-error")) {
+      sm <- summary(fit)$coefficients
+      p <- if (nrow(sm) >= 2) sm[2, 4] else NA_real_
+      if (isTRUE(p < alpha_eff)) hit <- hit + 1L
+    }
+  }
+  hit / B
+}
+
+dpower_dn_fd <- function(n_vec, pwr_vec) {
+  n <- as.numeric(n_vec); p <- as.numeric(pwr_vec)
+  k <- length(n); d <- rep(NA_real_, k)
+  if (k >= 2) { d[1:(k-1)] <- diff(p)/pmax(1, diff(n)); d[k] <- d[k-1] }
+  d
+}
+
+solve_n_for_power <- function(G, qtl_index, beta, target = 0.8, n_min = 30, n_max = 1000,
+                              alpha = 0.05, alpha_method = "bonferroni", B = 150, seed = 123) {
+  lo <- n_min; hi <- n_max; best <- hi
+  while (lo <= hi) {
+    mid <- floor((lo + hi)/2)
+    p_mid <- power_simulate(G, qtl_index, beta, mid, B = B, alpha = alpha,
+                            alpha_method = alpha_method, seed = seed)
+    if (p_mid >= target) { best <- mid; hi <- mid - 1 } else { lo <- mid + 1 }
+  }
+  list(n = best,
+       power = power_simulate(G, qtl_index, beta, best, B = max(250,B),
+                              alpha = alpha, alpha_method = alpha_method, seed = seed))
+}
+
+# -----------------------------
+# QC & missing handling
+# -----------------------------
+compute_qc <- function(G) {
+  miss_mark <- colMeans(is.na(G))
+  miss_ind  <- rowMeans(is.na(G))
+  p_hat <- colMeans(G, na.rm = TRUE)/2
+  maf <- pmin(p_hat, 1 - p_hat)
+  list(miss_mark = miss_mark, miss_ind = miss_ind, maf = maf)
+}
+apply_filters <- function(G, max_miss_mark=0.1, max_miss_ind=0.1, maf_min=0.01) {
+  qc <- compute_qc(G)
+  keep_mark <- which(qc$miss_mark <= max_miss_mark & qc$maf >= maf_min & !is.na(qc$maf))
+  keep_ind  <- which(qc$miss_ind <= max_miss_ind)
+  if (length(keep_mark) == 0 || length(keep_ind) == 0) return(G[0,0,drop=FALSE])
+  G[keep_ind, keep_mark, drop = FALSE]
+}
+apply_missing_action <- function(G, mode = c("impute", "drop_rows_with_na", "drop_cols_with_na", "none")) {
+  mode <- match.arg(mode)
+  if (is.null(G)) return(G)
+  if (mode == "none") return(G)
+  if (mode == "drop_rows_with_na") return(G[rowSums(is.na(G)) == 0, , drop = FALSE])
+  if (mode == "drop_cols_with_na") return(G[, colSums(is.na(G)) == 0, drop = FALSE])
+  cm <- colMeans(G, na.rm = TRUE)
+  for (j in seq_len(ncol(G))) {
+    idx <- which(is.na(G[, j])); if (length(idx)) G[idx, j] <- cm[j]
+  }
+  G
+}
+
+# -----------------------------
+# UI
+# -----------------------------
+ui <- navbarPage(
+  title = "QTL Design Sandbox",
+  theme = shinytheme("flatly"),
+
+  tabPanel("Data",
+    sidebarLayout(
+      sidebarPanel(
+        numericInput("n_ind",  "Number of individuals (demo)", 400, min = 50, step = 50),
+        numericInput("m_mark", "Number of markers (demo)",     200, min = 50, step = 50),
+        sliderInput("maf", "MAF (demo)", min = 0.05, max = 0.5, value = 0.3, step = 0.01),
+        checkboxInput("demo_realistic", "Use realistic demo (subpop + LD + missingness)", TRUE),
+        actionButton("btn_gen", "Generate demo genotype"),
+        tags$hr(),
+        fileInput("geno_file", "Or upload genotype (CSV, 0/1/2)", accept = c(".csv")),
+        helpText("Format: rows = individuals, columns = markers; values = 0/1/2 (NA allowed)."),
+        tags$hr(),
+        h4("Missing-data handling"),
+        radioButtons("missing_mode", NULL,
+          c("Impute by column mean (recommended)" = "impute",
+            "Drop rows with any NA" = "drop_rows_with_na",
+            "Drop columns with any NA" = "drop_cols_with_na",
+            "Do nothing" = "none"), selected = "impute"),
+        actionButton("btn_missing_apply", "Apply missing-data handling"),
+        tags$hr(),
+        h4("QC Filters"),
+        sliderInput("f_miss_mark", "Marker missingness max (%)", min = 0, max = 50, value = 20, step = 1),
+        sliderInput("f_miss_ind",  "Individual missingness max (%)", min = 0, max = 50, value = 20, step = 1),
+        sliderInput("f_maf_min",   "MAF minimum", min = 0.0, max = 0.1, value = 0.01, step = 0.005),
+        checkboxInput("apply_filters_downstream", "Use filtered data for analysis", TRUE),
+        actionButton("btn_qc", "Run QC & Apply Filters"),
+        tags$hr(),
+        actionButton("btn_refs", "Show References")
+      ),
+      mainPanel(
+        h4("Data overview"),
+        DTOutput("geno_head"),
+        tags$hr(),
+        fluidRow(
+          column(6,
+            h4("Dimensions & MAF"),
+            verbatimTextOutput("dim_maf_summary"),
+            plotOutput("maf_hist", height = 220)
+          ),
+          column(6,
+            h4("Missingness"),
+            plotOutput("miss_mark_hist", height = 220),
+            plotOutput("miss_ind_hist", height = 220),
+            verbatimTextOutput("missing_action_summary")
+          )
+        ),
+        tags$hr(),
+        h4("QC Summary"),
+        verbatimTextOutput("qc_summary")
+      )
+    )
+  ),
+
+  tabPanel("Model",
+    sidebarLayout(
+      sidebarPanel(
+        selectInput("model_type", "Statistical model",
+          c("Single-marker (SIM)" = "sim", "LMM (placeholder)" = "lmm")),
+        numericInput("alpha", "Genome-wide significance α", 0.05, min = 1e-6, step = 0.01),
+        selectInput("alpha_method", "Multiple testing", c("bonferroni", "fdr")),
+        numericInput("rc2", "Covariate explained variance Rc^2", 0.0, min = 0, max = 0.9, step = 0.05),
+        tags$hr(),
+        numericInput("qtl_idx_model", "True QTL index (column)", 1, min = 1, step = 1),
+        numericInput("beta_eff_model", "QTL effect β (standardised)", 0.2, step = 0.05),
+        actionButton("btn_model_fit", "Run model analysis")
+      ),
+      mainPanel(
+        h4("Model analysis summary"),
+        verbatimTextOutput("model_summary"),
+        h4("t-distribution (df = n_eff − 2) with observed t"),
+        plotOutput("t_plot", height = 300)
+      )
+    )
+  ),
+
+  tabPanel("Power",
+    sidebarLayout(
+      sidebarPanel(
+        numericInput("qtl_idx", "True QTL index (column)", 1, min = 1, step = 1),
+        numericInput("beta_eff", "QTL effect β (standardised)", 0.2, step = 0.05),
+        sliderInput("n_grid", "Sample size grid", min = 50, max = 1000, value = c(100, 500), step = 50),
+        numericInput("grid_step", "Grid step", 50, min = 10, step = 10),
+        numericInput("B_sim", "Simulation repeats B", 200, min = 50, step = 50),
+        checkboxInput("fast_sim", "Fast simulation (test QTL only)", TRUE),
+        actionButton("btn_run", "Run power analysis")
+      ),
+      mainPanel(
+        h4("Analytic vs simulation power curves"),
+        plotOutput("power_plot"),
+        DTOutput("power_table")
+      )
+    )
+  ),
+
+  tabPanel("Derivative (dPower/dn)",
+    sidebarLayout(
+      sidebarPanel(
+        numericInput("deriv_thresh", "Stopping threshold (dPower/dn)", 0.005, step = 0.001),
+        helpText("When marginal gain falls below this threshold, suggest stopping additional sampling.")
+      ),
+      mainPanel(
+        h4("dPower/dn curve"),
+        plotOutput("deriv_plot"),
+        verbatimTextOutput("stop_msg")
+      )
+    )
+  ),
+
+  tabPanel("Solver",
+    sidebarLayout(
+      sidebarPanel(
+        numericInput("target_power", "Target power", 0.8, min = 0.5, max = 0.99, step = 0.01),
+        numericInput("solve_min", "Min n", 50, min = 30),
+        numericInput("solve_max", "Max n", 1000, min = 100),
+        numericInput("B_solve", "Simulation repeats (solver)", 150, min = 50),
+        actionButton("btn_solve", "Solve n*")
+      ),
+      mainPanel(
+        h4("Sample size inversion"),
+        verbatimTextOutput("solve_text")
+      )
+    )
+  ),
+
+  tabPanel("Report",
+    sidebarLayout(
+      sidebarPanel(
+        textInput("proj_name", "Project name", "QTL_Design_Run"),
+        downloadButton("dl_report", "Download parameter summary (txt)")
+      ),
+      mainPanel(
+        h4("Export contents"),
+        p("Export includes: key parameters, analytic/simulation highlights, dPower/dn threshold & suggestions.")
+      )
+    )
+  )
+)
+
+# -----------------------------
+# SERVER
+# -----------------------------
+server <- function(input, output, session) {
+
+  G_raw  <- reactiveVal(NULL)
+  G_filt <- reactiveVal(NULL)
+  G_step_missing <- reactiveVal(NULL)
+
+  fallback_demo <- reactive({
+    genotype_sim_realistic(n = 200, m = 400, seed = 1)
+  })
+
+  # Robust active matrix (fallback to demo when empty)
+  G_active <- reactive({
+    Gcand <- if (isTRUE(input$apply_filters_downstream) && !is.null(G_filt())) {
+      G_filt()
+    } else if (!is.null(G_step_missing())) {
+      G_step_missing()
+    } else if (!is.null(G_raw())) {
+      G_raw()
+    } else {
+      NULL
+    }
+    if (is.null(Gcand) || nrow(Gcand) < 2 || ncol(Gcand) < 1) return(fallback_demo())
+    Gcand
+  })
+
+  # --- Data events ---
+  observeEvent(input$btn_gen, {
+    if (isTRUE(input$demo_realistic)) {
+      G <- genotype_sim_realistic(n = input$n_ind, m = input$m_mark, maf_center = input$maf, seed = 1)
+    } else {
+      G <- genotype_sim(n = input$n_ind, m = input$m_mark, maf = input$maf)
+    }
+    G_raw(G); G_step_missing(NULL); G_filt(NULL)
+  }, ignoreInit = TRUE)
+
+  observeEvent(input$geno_file, {
+    req(input$geno_file)
+    df <- fread(input$geno_file$datapath)
+    G  <- as.matrix(df)
+    if (!all(G %in% c(0,1,2, NA))) {
+      showNotification("Non 0/1/2 encoding detected; please use additive 0/1/2 coding (NA allowed).", type = "error")
+      return(NULL)
+    }
+    G_raw(G); G_step_missing(NULL); G_filt(NULL)
+  }, ignoreInit = TRUE)
+
+  observeEvent(input$btn_missing_apply, {
+    G0 <- G_raw()
+    if (is.null(G0)) { showNotification("No raw genotype available. Use demo or upload.", type = "warning"); return(NULL) }
+    G1 <- apply_missing_action(G0, mode = input$missing_mode)
+    G_step_missing(G1); G_filt(NULL)
+  }, ignoreInit = TRUE)
+
+  qc_results <- eventReactive(input$btn_qc, {
+    G0 <- if (!is.null(G_step_missing())) G_step_missing() else G_raw()
+    if (is.null(G0)) G0 <- fallback_demo()
+    qc0 <- compute_qc(G0)
+    G1 <- apply_filters(G0, max_miss_mark = input$f_miss_mark/100,
+                             max_miss_ind  = input$f_miss_ind/100,
+                             maf_min       = input$f_maf_min)
+    qc1 <- compute_qc(G1)
+    G_filt(G1)
+    list(G0=G0, qc0=qc0, G1=G1, qc1=qc1)
+  }, ignoreInit = TRUE)
+
+  # --- Data outputs ---
+  output$geno_head <- renderDT({
+    G <- if(!is.null(G_raw())) G_raw() else fallback_demo()
+    datatable(as.data.table(G[1:min(10, nrow(G)), 1:min(10, ncol(G))]), options = list(scrollX = TRUE))
+  })
+
+  output$dim_maf_summary <- renderText({
+    G0 <- if(!is.null(G_raw())) G_raw() else fallback_demo()
+    qc0 <- compute_qc(G0)
+    txt <- glue("Raw (or fallback): N x M = {nrow(G0)} x {ncol(G0)} | Median MAF = {round(median(qc0$maf, na.rm=TRUE),3)}")
+    if (!is.null(G_step_missing())) {
+      Gm <- G_step_missing(); qcm <- compute_qc(Gm)
+      txt <- paste0(txt, "\n", glue("After missing-handling: N x M = {nrow(Gm)} x {ncol(Gm)} | Median MAF = {round(median(qcm$maf, na.rm=TRUE),3)}"))
+    }
+    if (!is.null(G_filt())) {
+      G1 <- G_filt(); qc1 <- compute_qc(G1)
+      txt <- paste0(txt, "\n", glue("Filtered: N x M = {nrow(G1)} x {ncol(G1)} | Median MAF = {round(median(qc1$maf, na.rm=TRUE),3)}"))
+    }
+    txt
+  })
+
+  output$maf_hist <- renderPlot({
+    G <- if(!is.null(G_raw())) G_raw() else fallback_demo()
+    df <- data.frame(MAF = compute_qc(G)$maf)
+    ggplot(df, aes(MAF)) + geom_histogram(bins = 40, na.rm = TRUE) +
+      theme_minimal() + labs(title="MAF distribution (raw)", x="MAF", y="Count")
+  })
+
+  output$miss_mark_hist <- renderPlot({
+    G <- if(!is.null(G_raw())) G_raw() else fallback_demo()
+    df <- data.frame(miss = compute_qc(G)$miss_mark * 100)
+    ggplot(df, aes(miss)) + geom_histogram(bins = 40, na.rm = TRUE) +
+      theme_minimal() + labs(title="Marker missingness (%)", x="%", y="Count")
+  })
+
+  output$miss_ind_hist <- renderPlot({
+    G <- if(!is.null(G_raw())) G_raw() else fallback_demo()
+    df <- data.frame(miss = compute_qc(G)$miss_ind * 100)
+    ggplot(df, aes(miss)) + geom_histogram(bins = 40, na.rm = TRUE) +
+      theme_minimal() + labs(title="Individual missingness (%)", x="%", y="Count")
+  })
+
+  output$missing_action_summary <- renderText({
+    if (is.null(G_raw())) return("Missing-data handling: waiting for raw genotype (or use demo).")
+    mode <- switch(input$missing_mode,
+                   impute = "Impute by column mean",
+                   drop_rows_with_na = "Drop rows with any NA",
+                   drop_cols_with_na = "Drop columns with any NA",
+                   none = "Do nothing")
+    glue("Selected missing-data handling: {mode}. Click 'Apply' to effect.")
+  })
+
+  output$qc_summary <- renderText({
+    G0 <- if(!is.null(G_raw())) G_raw() else fallback_demo()
+    qc0 <- compute_qc(G0)
+    msg <- c(glue("Raw (or fallback): N x M = {nrow(G0)} x {ncol(G0)}; median MAF = {round(median(qc0$maf,na.rm=TRUE),3)};"),
+             glue("Low-diversity markers (MAF<0.05): {round(mean(qc0$maf<0.05, na.rm=TRUE),3)}"))
+    if (!is.null(G_filt())) {
+      G1 <- G_filt(); qc1 <- compute_qc(G1)
+      msg <- c(msg,
+        glue("Filtered: N x M = {nrow(G1)} x {ncol(G1)}; median MAF = {round(median(qc1$maf,na.rm=TRUE),3)};"),
+        glue("Low-diversity markers (MAF<0.05): {round(mean(qc1$maf<0.05, na.rm=TRUE),3)}"),
+        glue("Bonferroni alpha/M: {input$alpha}/{ncol(G0)} -> {input$alpha}/{ncol(G1)}")
+      )
+    }
+    paste(msg, collapse = "\n")
+  })
+
+  # ---------------- Model page ----------------
+  model_fit_res <- eventReactive(input$btn_model_fit, {
+    G <- G_active()
+    qidx <- safe_index(input$qtl_idx_model, ncol(G), default = 1L)
+
+    # mean-impute the chosen QTL column to avoid NA in simulate_trait_gaussian
+    G_use <- G
+    cm <- mean(G_use[, qidx], na.rm = TRUE); if (!is.finite(cm)) cm <- 0
+    na_rows <- which(is.na(G_use[, qidx])); if (length(na_rows)) G_use[na_rows, qidx] <- cm
+
+    beta <- input$beta_eff_model
+    y <- simulate_trait_gaussian(G_use, qtl_index = qidx, beta = beta, h2 = 0.2, seed = 123)
+
+    scan <- single_marker_scan(G_use, y)
+    list(G = G_use, y = y, scan = scan, qidx = qidx)
+  }, ignoreInit = TRUE)
+
+  output$model_summary <- renderText({
+    res <- model_fit_res()
+    G <- res$G; qidx <- res$qidx; p <- res$scan$p; tstats <- res$scan$t
+    alpha_eff <- effective_alpha(input$alpha, ncol(G), input$alpha_method)
+    passed <- isTRUE(p[qidx] < alpha_eff)
+    p_show <- if (is.finite(p[qidx])) signif(p[qidx], 3) else NA
+    t_show <- if (is.finite(tstats[qidx])) round(tstats[qidx], 3) else NA
+    glue("Model: {input$model_type}; alpha={input$alpha} ({input$alpha_method}), effective alpha={signif(alpha_eff,3)}\n",
+         "N x M = {nrow(G)} x {ncol(G)}; selected marker = {qidx}\n",
+         "Observed t = {t_show}, p = {p_show}; ",
+         if (passed) 'PASS genome-wide threshold' else 'NOT significant at genome-wide level')
+  })
+
+  output$t_plot <- renderPlot({
+    res <- model_fit_res()
+    cc <- complete.cases(res$y, res$G[, res$qidx])
+    n_eff <- sum(cc); df <- max(1, n_eff - 2)
+    alpha_eff <- effective_alpha(input$alpha, ncol(res$G), input$alpha_method)
+    alpha_eff <- min(max(alpha_eff, 1e-12), 0.999999)
+    tcrit <- qt(1 - alpha_eff/2, df = df)
+    t_obs <- res$scan$t[res$qidx]; if (!is.finite(t_obs)) t_obs <- 0
+    xs <- seq(-4*max(1,abs(tcrit)), 4*max(1,abs(tcrit)), length.out = 1000)
+    dens <- dt(xs, df = df)
+    ggplot(data.frame(x=xs, y=dens), aes(x,y)) +
+      geom_line() +
+      geom_vline(xintercept = c(-tcrit, tcrit), linetype = "dashed") +
+      geom_vline(xintercept = t_obs, linetype = "solid") +
+      theme_minimal() +
+      labs(title = glue("t-distribution (df={df}); dashed=±t_crit, solid=t_obs"),
+           x = "t", y = "density")
+  })
+
+  # ---------------- Power page (fast/slow sim + progress) ----------------
+  power_df <- eventReactive(input$btn_run, {
+    tryCatch({
+      G <- G_active(); req(G)
+
+      M <- ncol(G); N <- nrow(G)
+      qidx <- safe_index(input$qtl_idx, M, default = 1L)
+      n_range <- safe_n_grid(input$n_grid, input$grid_step, N)
+
+      beta  <- if (is.finite(input$beta_eff)) input$beta_eff else 0.2
+      alpha <- if (is.finite(input$alpha)) input$alpha else 0.05
+      method <- if (is.null(input$alpha_method)) "bonferroni" else input$alpha_method
+      rc2 <- if (is.finite(input$rc2)) input$rc2 else 0
+
+      alpha_eff <- effective_alpha(alpha, M, method)
+
+      # Robust maf (fallback to 0.25)
+      if (M >= 1) {
+        p_hat <- mean(colMeans(G, na.rm = TRUE) / 2)
+        maf <- pmin(p_hat, 1 - p_hat)
+        if (!is.finite(maf) || maf <= 0) maf <- 0.25
+      } else {
+        maf <- 0.25
+      }
+
+      pwr_a <- sapply(n_range, function(n)
+        power_analytic_single_marker(n, beta, maf, alpha_eff, rc2 = rc2, sigma2 = 1))
+
+      B <- if (is.finite(input$B_sim)) input$B_sim else 200
+
+      # progress bar & fast/slow switch
+      pwr_s <- withProgress(message = "Running simulation", value = 0, {
+        res <- numeric(length(n_range))
+        for (i in seq_along(n_range)) {
+          n_i <- n_range[i]
+          if (isTRUE(input$fast_sim)) {
+            res[i] <- power_simulate_qtl_only(G, qtl_index = qidx, beta = beta, n = n_i,
+                                              B = B, alpha = alpha, alpha_method = method)
+          } else {
+            res[i] <- power_simulate(G, qtl_index = qidx, beta = beta, n = n_i,
+                                     B = B, alpha = alpha, alpha_method = method)
+          }
+          incProgress(1/length(n_range),
+                      detail = sprintf("n = %d (%d/%d)", n_i, i, length(n_range)))
+        }
+        res
+      })
+
+      data.frame(n = n_range, power_analytic = pwr_a, power_sim = pwr_s)
+    }, error = function(e) {
+      showNotification(paste("Power analysis failed:", conditionMessage(e)),
+                       type = "error", duration = 8)
+      data.frame(n = integer(0), power_analytic = numeric(0), power_sim = numeric(0))
+    })
+  })
+
+  output$power_plot <- renderPlot({
+    df <- power_df()
+    if (nrow(df) == 0) {
+      plot.new(); title("Power analysis did not return data.\nCheck Data/QC settings or try demo.")
+      return(invisible())
+    }
+    ggplot(df, aes(n)) +
+      geom_line(aes(y = power_analytic), linetype = "dashed") +
+      geom_point(aes(y = power_sim)) +
+      labs(y = "Power", title = "Analytic (dashed) vs Simulation (points)") +
+      theme_minimal()
+  })
+
+  output$power_table <- renderDT({
+    df <- power_df()
+    if (nrow(df) == 0) {
+      return(datatable(data.frame(Note = "No power results. Adjust inputs and click Run."),
+                       options = list(dom='t')))
+    }
+    datatable(df, options = list(pageLength = 10))
+  })
+
+  # ---------------- Derivative ----------------
+  output$deriv_plot <- renderPlot({
+    df <- power_df(); req(df)
+    d <- dpower_dn_fd(df$n, df$power_sim)
+    ggplot(data.frame(n=df$n, dpower=d), aes(n, dpower)) +
+      geom_line() +
+      geom_hline(yintercept = input$deriv_thresh, linetype = "dotted") +
+      labs(y = "dPower/dn (finite diff)", title = "Marginal gain curve") +
+      theme_minimal()
+  })
+
+  output$stop_msg <- renderText({
+    df <- power_df(); req(df)
+    d <- dpower_dn_fd(df$n, df$power_sim)
+    below <- which(d <= input$deriv_thresh)
+    if (length(below) == 0) "No stopping threshold triggered within the current grid."
+    else glue("Suggested stopping point: n ≈ {df$n[min(below)]} (dPower/dn ≤ {input$deriv_thresh})")
+  })
+
+  # ---------------- Solver (safe_index + tryCatch) ----------------
+  solve_res <- eventReactive(input$btn_solve, {
+    tryCatch({
+      G <- G_active(); req(G)
+      qidx <- safe_index(input$qtl_idx, ncol(G), default = 1L)
+      solve_n_for_power(G, qtl_index = qidx, beta = input$beta_eff,
+                        target = input$target_power,
+                        n_min = input$solve_min, n_max = input$solve_max,
+                        alpha = input$alpha, alpha_method = input$alpha_method,
+                        B = input$B_solve, seed = 321)
+    }, error = function(e) {
+      showNotification(paste("Solver failed:", conditionMessage(e)),
+                       type = "error", duration = 8)
+      list(n = NA_integer_, power = NA_real_)
+    })
+  })
+
+  output$solve_text <- renderText({
+    res <- solve_res(); req(res)
+    glue("Minimum sample size n* = {res$n}\nSimulation-confirmed power ≈ {round(res$power,3)}")
+  })
+
+  # ---------------- Report ----------------
+  output$dl_report <- downloadHandler(
+    filename = function() paste0(input$proj_name, "_summary.txt"),
+    content = function(file) {
+      G <- G_active()
+      txt <- c(
+        glue("Project: {input$proj_name}"),
+        glue("N x M: {nrow(G)} x {ncol(G)}"),
+        glue("Model: {input$model_type}, alpha={input$alpha}, mult={input$alpha_method}, Rc2={input$rc2}"),
+        glue("QTL idx={input$qtl_idx}, beta={input$beta_eff}"),
+        glue("n grid: {paste(seq(input$n_grid[1], input$n_grid[2], by = input$grid_step), collapse=', ')}"),
+        glue("B(sim)={input$B_sim}, dPower/dn stop={input$deriv_thresh}"),
+        glue("Target power={input$target_power} (solver bounds {input$solve_min}-{input$solve_max})")
+      )
+      writeLines(txt, con = file)
+    }
+  )
+
+  # References modal
+  observeEvent(input$btn_refs, {
+    dat <- data.frame(
+      Topic = c("Multiple testing (FDR)", "LMM for population structure"),
+      Citation = c("Benjamini & Hochberg (1995) JRSS-B", "Kang et al. (2010) EMMAX; Lippert et al. (2011) FaST-LMM"),
+      Link = c("https://doi.org/10.1111/j.2517-6161.1995.tb02031.x", "https://doi.org/10.1038/ng.548"),
+      stringsAsFactors = FALSE
+    )
+    showModal(modalDialog(
+      title = "References",
+      DTOutput("refs_table"),
+      easyClose = TRUE, size = "l", footer = NULL
+    ))
+    output$refs_table <- renderDT({
+      dat$Link <- sprintf("<a href='%s' target='_blank'>link</a>", dat$Link)
+      datatable(dat, escape = FALSE, options = list(pageLength = 10))
+    })
+  })
+}
+
+shinyApp(ui, server)
+
+```
+
+V5
+```{r}
+# app.R
+# QTL Design Sandbox (Shiny, robust Power + Fast Sim + Fast Solver with progress)
+# ----------------------------------------------------------------
+suppressPackageStartupMessages({
+  library(shiny); library(shinythemes)
+  library(data.table); library(DT); library(ggplot2)
+  library(MASS); library(stats); library(glue)
+  library(irlba)
+})
+
+# -----------------------------
+# Data simulators
+# -----------------------------
+genotype_sim <- function(n = 400, m = 200, maf = 0.3, seed = 1) {
+  set.seed(seed)
+  G <- matrix(rbinom(n * m, 2, maf), nrow = n, ncol = m)
+  colnames(G) <- paste0("M", seq_len(m))
+  G
+}
+
+genotype_sim_realistic <- function(n = 200, m = 400,
+                                   K = 3, maf_center = 0.30,
+                                   maf_walk_sd = 0.01, subpop_drift_sd = 0.05,
+                                   marker_hetero_sd = 0.02,
+                                   block_size = 10, copy_prob = 0.85, mutate_prob = 0.05,
+                                   mean_miss = 0.05, seed = 1) {
+  set.seed(seed)
+  sizes <- rep(floor(n / K), K); sizes[seq_len(n %% K)] <- sizes[seq_len(n %% K)] + 1
+  groups <- rep(seq_len(K), sizes); groups <- sample(groups)
+  p_base <- pmin(pmax(cumsum(rnorm(m, 0, maf_walk_sd)) + maf_center, 0.02), 0.98)
+  drift <- rnorm(K, 0, subpop_drift_sd)
+  p_sub <- sapply(drift, function(d) pmin(pmax(p_base + d, 0.02), 0.98))
+  p_sub <- t(p_sub) + matrix(rnorm(K * m, 0, marker_hetero_sd), nrow = K)
+  p_sub <- pmin(pmax(p_sub, 0.02), 0.98)
+  G <- matrix(NA_real_, nrow = n, ncol = m)
+  for (i in seq_len(n)) G[i, ] <- rbinom(m, 2, p_sub[groups[i], ])
+  for (start in seq(1, m, by = block_size)) {
+    end <- min(start + block_size - 1, m)
+    if (end > start) {
+      ref <- start
+      for (j in (ref + 1):end) {
+        mask <- runif(n) < copy_prob
+        G[mask, j] <- G[mask, ref]
+        flip <- runif(n) < mutate_prob
+        if (any(flip)) G[flip, j] <- rbinom(sum(flip), 2, p_base[j])
+      }
+    }
+  }
+  a <- 1.2; b <- max(a / max(1e-6, mean_miss) - a, 1.1)
+  miss_rate <- rbeta(m, a, b)
+  for (j in seq_len(m)) {
+    miss <- runif(n) < miss_rate[j]
+    if (any(miss)) G[miss, j] <- NA
+  }
+  colnames(G) <- paste0("M", seq_len(m))
+  G
+}
+
+# -----------------------------
+# Trait + association
+# -----------------------------
+# NA-safe simulate_trait_gaussian (impute QTL column; guard variances)
+simulate_trait_gaussian <- function(G, qtl_index, beta, h2 = 0.2, rc2 = 0, seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  n <- nrow(G)
+  qtl_index <- max(1L, min(as.integer(qtl_index), ncol(G)))
+
+  # Mean-impute the chosen QTL column so g_eff has no NA
+  if (anyNA(G[, qtl_index])) {
+    cm <- mean(G[, qtl_index], na.rm = TRUE); if (!is.finite(cm)) cm <- 0
+    nas <- which(is.na(G[, qtl_index]))
+    if (length(nas)) G[nas, qtl_index] <- cm
+  }
+
+  g_eff <- as.numeric(G[, qtl_index, drop = FALSE] %*% beta)
+  var_g <- var(g_eff); if (!is.finite(var_g) || var_g < 1e-12) var_g <- 1e-12
+
+  # h2 = var_g / (var_g + sigma2_e)  ->  sigma2_e = var_g(1-h2)/h2
+  sigma2_e <- (var_g - h2 * var_g) / max(1e-12, h2)
+  if (!is.finite(sigma2_e) || sigma2_e <= 0) sigma2_e <- 1e-6
+
+  y <- scale(g_eff + rnorm(n, 0, sqrt(sigma2_e)), center = TRUE, scale = TRUE)[,1]
+  attr(y, "sigma2_e") <- sigma2_e
+  y
+}
+
+single_marker_scan <- function(G, y) {
+  # returns p-values and t-statistics per marker with NA-safe LM
+  nmark <- ncol(G)
+  pvals <- numeric(nmark); tstats <- numeric(nmark)
+  for (j in seq_len(nmark)) {
+    fit <- try(suppressWarnings(lm(y ~ G[, j], na.action = na.omit)), silent = TRUE)
+    if (inherits(fit, "try-error")) { pvals[j] <- NA_real_; tstats[j] <- NA_real_; next }
+    sm <- summary(fit)$coefficients
+    if (nrow(sm) >= 2) { pvals[j] <- sm[2,4]; tstats[j] <- sm[2,3] } else { pvals[j] <- NA_real_; tstats[j] <- NA_real_ }
+  }
+  list(p = pvals, t = tstats)
+}
+
+effective_alpha <- function(alpha, M, method = c("bonferroni","fdr")) {
+  # Robust to NULL/NA method
+  if (is.null(method) || length(method) == 0 || !is.finite(M)) method <- "bonferroni"
+  method <- tryCatch(match.arg(method), error = function(e) "bonferroni")
+  if (!is.finite(alpha) || alpha <= 0) alpha <- 0.05
+  if (!is.finite(M) || M < 1L) M <- 1L
+  if (identical(method, "bonferroni")) return(alpha / max(1, as.integer(M)))
+  alpha
+}
+
+power_analytic_single_marker <- function(n, beta, maf, alpha_eff, rc2 = 0, sigma2 = 1) {
+  vg <- 2 * maf * (1 - maf); if (vg < 1e-12) return(0)
+  lambda <- n * (beta^2) * vg / (sigma2 * (1 - rc2 + 1e-12))
+  z <- qnorm(1 - alpha_eff/2); m <- sqrt(lambda)
+  pwr <- pnorm(-z, mean = m, sd = 1) + (1 - pnorm(z, mean = m, sd = 1))
+  pmin(pmax(pwr, 0), 1)
+}
+
+# -----------------------------
+# SAFE HELPERS
+# -----------------------------
+safe_index <- function(idx, M, default = 1L) {
+  idx <- suppressWarnings(as.integer(idx))
+  if (is.na(idx) || !is.finite(M) || M < 1L) return(as.integer(default))
+  if (idx < 1L || idx > M) return(as.integer(default))
+  as.integer(idx)
+}
+
+safe_n_grid <- function(n_grid, step, N, fallback = NULL) {
+  n1 <- n_grid[1]; n2 <- n_grid[2]
+  if (!is.finite(n1)) n1 <- 100
+  if (!is.finite(n2)) n2 <- max(150, n1 + 50)
+  if (!is.finite(step) || step <= 0) step <- 50
+  xs <- seq(n1, n2, by = step)
+  xs <- xs[is.finite(xs)]
+  xs <- xs[xs >= 2 & xs <= N]
+  if (length(xs) == 0L) {
+    if (is.null(fallback)) xs <- pmin(max(2L, floor(N/2)), N) else xs <- fallback
+  }
+  as.integer(xs)
+}
+
+# -----------------------------
+# Robust simulation (original; whole-genome scan with NA-safe imputation)
+# -----------------------------
+power_simulate <- function(G, qtl_index, beta, n, B = 200, alpha = 0.05,
+                           alpha_method = "bonferroni", seed = 1) {
+  set.seed(seed)
+  M <- ncol(G)
+  if (!is.finite(M) || M < 1L) return(0)  # no markers → 0 power
+  qtl_index <- safe_index(qtl_index, M, default = 1L)
+
+  alpha_eff <- effective_alpha(alpha, M, alpha_method)
+  out <- logical(B)
+  N <- nrow(G)
+  n_eff <- max(2L, min(as.integer(n), N))  # clamp to [2, N]
+
+  for (b in seq_len(B)) {
+    idx <- sample.int(N, n_eff, replace = FALSE)
+    Gb <- G[idx, , drop = FALSE]
+
+    # Column-mean imputation for sampled matrix (robust to NA anywhere)
+    if (anyNA(Gb)) {
+      cm <- colMeans(Gb, na.rm = TRUE)
+      for (j in seq_len(ncol(Gb))) {
+        nas <- which(is.na(Gb[, j]))
+        if (length(nas)) {
+          v <- cm[j]; if (!is.finite(v)) v <- 0
+          Gb[nas, j] <- v
+        }
+      }
+    }
+
+    yb <- simulate_trait_gaussian(Gb, qtl_index, beta, h2 = 0.2)
+    res <- single_marker_scan(Gb, yb)
+    out[b] <- any(res$p[qtl_index] < alpha_eff, na.rm = TRUE)
+  }
+  mean(out)
+}
+
+# -----------------------------
+# NEW: Fast simulation (QTL-only testing; big speedup)
+# -----------------------------
+power_simulate_qtl_only <- function(G, qtl_index, beta, n, B = 200, alpha = 0.05,
+                                    alpha_method = "bonferroni", seed = 1) {
+  set.seed(seed)
+  M <- ncol(G)
+  if (!is.finite(M) || M < 1L) return(0)
+  qtl_index <- safe_index(qtl_index, M, default = 1L)
+
+  alpha_eff <- effective_alpha(alpha, M, alpha_method)
+  N <- nrow(G)
+  n_eff <- max(2L, min(as.integer(n), N))
+  hit <- 0L
+
+  for (b in seq_len(B)) {
+    idx <- sample.int(N, n_eff, replace = FALSE)
+    Gb <- G[idx, qtl_index, drop = FALSE]
+
+    # impute THIS marker only
+    if (anyNA(Gb[, 1])) {
+      v <- mean(Gb[, 1], na.rm = TRUE); if (!is.finite(v)) v <- 0
+      nas <- which(is.na(Gb[, 1])); if (length(nas)) Gb[nas, 1] <- v
+    }
+
+    yb <- simulate_trait_gaussian(cbind(Gb), qtl_index = 1L, beta = beta, h2 = 0.2)
+    fit <- suppressWarnings(try(lm(yb ~ Gb[, 1], na.action = na.omit), silent = TRUE))
+    if (!inherits(fit, "try-error")) {
+      sm <- summary(fit)$coefficients
+      p <- if (nrow(sm) >= 2) sm[2, 4] else NA_real_
+      if (isTRUE(p < alpha_eff)) hit <- hit + 1L
+    }
+  }
+  hit / B
+}
+
+dpower_dn_fd <- function(n_vec, pwr_vec) {
+  n <- as.numeric(n_vec); p <- as.numeric(pwr_vec)
+  k <- length(n); d <- rep(NA_real_, k)
+  if (k >= 2) { d[1:(k-1)] <- diff(p)/pmax(1, diff(n)); d[k] <- d[k-1] }
+  d
+}
+
+solve_n_for_power <- function(G, qtl_index, beta, target = 0.8, n_min = 30, n_max = 1000,
+                              alpha = 0.05, alpha_method = "bonferroni", B = 150, seed = 123) {
+  lo <- n_min; hi <- n_max; best <- hi
+  while (lo <= hi) {
+    mid <- floor((lo + hi)/2)
+    p_mid <- power_simulate(G, qtl_index, beta, mid, B = B, alpha = alpha,
+                            alpha_method = alpha_method, seed = seed)
+    if (p_mid >= target) { best <- mid; hi <- mid - 1 } else { lo <- mid + 1 }
+  }
+  list(n = best,
+       power = power_simulate(G, qtl_index, beta, best, B = max(250,B),
+                              alpha = alpha, alpha_method = alpha_method, seed = seed))
+}
+
+# -----------------------------
+# NEW: Fast solver (QTL-only) with progress bar
+# -----------------------------
+solve_n_for_power_fast <- function(G, qtl_index, beta, target = 0.8,
+                                   n_min = 30, n_max = 1000,
+                                   alpha = 0.05, alpha_method = "bonferroni",
+                                   B = 100, seed = 321) {
+  set.seed(seed)
+  M <- ncol(G); N <- nrow(G)
+  if (!is.finite(M) || M < 1L) stop("No markers available for solver.")
+  qtl_index <- safe_index(qtl_index, M, default = 1L)
+  lo <- max(2L, as.integer(n_min)); hi <- max(lo, as.integer(n_max))
+  lo <- max(2L, min(lo, N)); hi <- max(lo, min(hi, N))
+
+  max_calls <- ceiling(log2(max(1, hi - lo + 1))) + 1
+  calls_done <- 0
+
+  withProgress(message = "Solving n* (binary search)", value = 0, {
+    best <- hi
+    while (lo <= hi) {
+      mid <- floor((lo + hi)/2)
+      p_mid <- power_simulate_qtl_only(G, qtl_index = qtl_index, beta = beta,
+                                       n = mid, B = B, alpha = alpha,
+                                       alpha_method = alpha_method, seed = seed + calls_done)
+      calls_done <- calls_done + 1
+      incProgress(1 / max_calls, detail = sprintf("n=%d, power=%.3f", mid, p_mid))
+      if (p_mid >= target) { best <- mid; hi <- mid - 1 } else { lo <- mid + 1 }
+    }
+    list(n = best,
+         power = power_simulate_qtl_only(G, qtl_index = qtl_index, beta = beta,
+                                         n = best, B = max(150, B), alpha = alpha,
+                                         alpha_method = alpha_method, seed = seed + 999))
+  })
+}
+
+# -----------------------------
+# QC & missing handling
+# -----------------------------
+compute_qc <- function(G) {
+  miss_mark <- colMeans(is.na(G))
+  miss_ind  <- rowMeans(is.na(G))
+  p_hat <- colMeans(G, na.rm = TRUE)/2
+  maf <- pmin(p_hat, 1 - p_hat)
+  list(miss_mark = miss_mark, miss_ind = miss_ind, maf = maf)
+}
+apply_filters <- function(G, max_miss_mark=0.1, max_miss_ind=0.1, maf_min=0.01) {
+  qc <- compute_qc(G)
+  keep_mark <- which(qc$miss_mark <= max_miss_mark & qc$maf >= maf_min & !is.na(qc$maf))
+  keep_ind  <- which(qc$miss_ind <= max_miss_ind)
+  if (length(keep_mark) == 0 || length(keep_ind) == 0) return(G[0,0,drop=FALSE])
+  G[keep_ind, keep_mark, drop = FALSE]
+}
+apply_missing_action <- function(G, mode = c("impute", "drop_rows_with_na", "drop_cols_with_na", "none")) {
+  mode <- match.arg(mode)
+  if (is.null(G)) return(G)
+  if (mode == "none") return(G)
+  if (mode == "drop_rows_with_na") return(G[rowSums(is.na(G)) == 0, , drop = FALSE])
+  if (mode == "drop_cols_with_na") return(G[, colSums(is.na(G)) == 0, drop = FALSE])
+  cm <- colMeans(G, na.rm = TRUE)
+  for (j in seq_len(ncol(G))) {
+    idx <- which(is.na(G[, j])); if (length(idx)) G[idx, j] <- cm[j]
+  }
+  G
+}
+
+# -----------------------------
+# UI
+# -----------------------------
+ui <- navbarPage(
+  title = "QTL Design Sandbox",
+  theme = shinytheme("flatly"),
+
+  tabPanel("Data",
+    sidebarLayout(
+      sidebarPanel(
+        numericInput("n_ind",  "Number of individuals (demo)", 400, min = 50, step = 50),
+        numericInput("m_mark", "Number of markers (demo)",     200, min = 50, step = 50),
+        sliderInput("maf", "MAF (demo)", min = 0.05, max = 0.5, value = 0.3, step = 0.01),
+        checkboxInput("demo_realistic", "Use realistic demo (subpop + LD + missingness)", TRUE),
+        actionButton("btn_gen", "Generate demo genotype"),
+        tags$hr(),
+        fileInput("geno_file", "Or upload genotype (CSV, 0/1/2)", accept = c(".csv")),
+        helpText("Format: rows = individuals, columns = markers; values = 0/1/2 (NA allowed)."),
+        tags$hr(),
+        h4("Missing-data handling"),
+        radioButtons("missing_mode", NULL,
+          c("Impute by column mean (recommended)" = "impute",
+            "Drop rows with any NA" = "drop_rows_with_na",
+            "Drop columns with any NA" = "drop_cols_with_na",
+            "Do nothing" = "none"), selected = "impute"),
+        actionButton("btn_missing_apply", "Apply missing-data handling"),
+        tags$hr(),
+        h4("QC Filters"),
+        sliderInput("f_miss_mark", "Marker missingness max (%)", min = 0, max = 50, value = 20, step = 1),
+        sliderInput("f_miss_ind",  "Individual missingness max (%)", min = 0, max = 50, value = 20, step = 1),
+        sliderInput("f_maf_min",   "MAF minimum", min = 0.0, max = 0.1, value = 0.01, step = 0.005),
+        checkboxInput("apply_filters_downstream", "Use filtered data for analysis", TRUE),
+        actionButton("btn_qc", "Run QC & Apply Filters"),
+        tags$hr(),
+        actionButton("btn_refs", "Show References")
+      ),
+      mainPanel(
+        h4("Data overview"),
+        DTOutput("geno_head"),
+        tags$hr(),
+        fluidRow(
+          column(6,
+            h4("Dimensions & MAF"),
+            verbatimTextOutput("dim_maf_summary"),
+            plotOutput("maf_hist", height = 220)
+          ),
+          column(6,
+            h4("Missingness"),
+            plotOutput("miss_mark_hist", height = 220),
+            plotOutput("miss_ind_hist", height = 220),
+            verbatimTextOutput("missing_action_summary")
+          )
+        ),
+        tags$hr(),
+        h4("QC Summary"),
+        verbatimTextOutput("qc_summary")
+      )
+    )
+  ),
+
+  tabPanel("Model",
+    sidebarLayout(
+      sidebarPanel(
+        selectInput("model_type", "Statistical model",
+          c("Single-marker (SIM)" = "sim", "LMM (placeholder)" = "lmm")),
+        numericInput("alpha", "Genome-wide significance α", 0.05, min = 1e-6, step = 0.01),
+        selectInput("alpha_method", "Multiple testing", c("bonferroni", "fdr")),
+        numericInput("rc2", "Covariate explained variance Rc^2", 0.0, min = 0, max = 0.9, step = 0.05),
+        tags$hr(),
+        numericInput("qtl_idx_model", "True QTL index (column)", 1, min = 1, step = 1),
+        numericInput("beta_eff_model", "QTL effect β (standardised)", 0.2, step = 0.05),
+        actionButton("btn_model_fit", "Run model analysis")
+      ),
+      mainPanel(
+        h4("Model analysis summary"),
+        verbatimTextOutput("model_summary"),
+        h4("t-distribution (df = n_eff − 2) with observed t"),
+        plotOutput("t_plot", height = 300)
+      )
+    )
+  ),
+
+  tabPanel("Power",
+    sidebarLayout(
+      sidebarPanel(
+        numericInput("qtl_idx", "True QTL index (column)", 1, min = 1, step = 1),
+        numericInput("beta_eff", "QTL effect β (standardised)", 0.2, step = 0.05),
+        sliderInput("n_grid", "Sample size grid", min = 50, max = 1000, value = c(100, 500), step = 50),
+        numericInput("grid_step", "Grid step", 50, min = 10, step = 10),
+        numericInput("B_sim", "Simulation repeats B", 200, min = 50, step = 50),
+        checkboxInput("fast_sim", "Fast simulation (test QTL only)", TRUE),
+        actionButton("btn_run", "Run power analysis")
+      ),
+      mainPanel(
+        h4("Analytic vs simulation power curves"),
+        plotOutput("power_plot"),
+        DTOutput("power_table")
+      )
+    )
+  ),
+
+  tabPanel("Derivative (dPower/dn)",
+    sidebarLayout(
+      sidebarPanel(
+        numericInput("deriv_thresh", "Stopping threshold (dPower/dn)", 0.005, step = 0.001),
+        helpText("When marginal gain falls below this threshold, suggest stopping additional sampling.")
+      ),
+      mainPanel(
+        h4("dPower/dn curve"),
+        plotOutput("deriv_plot"),
+        verbatimTextOutput("stop_msg")
+      )
+    )
+  ),
+
+  tabPanel("Solver",
+    sidebarLayout(
+      sidebarPanel(
+        numericInput("target_power", "Target power", 0.8, min = 0.5, max = 0.99, step = 0.01),
+        numericInput("solve_min", "Min n", 50, min = 30),
+        numericInput("solve_max", "Max n", 1000, min = 100),
+        numericInput("B_solve", "Simulation repeats (solver)", 150, min = 50),
+        actionButton("btn_solve", "Solve n*")
+      ),
+      mainPanel(
+        h4("Sample size inversion"),
+        verbatimTextOutput("solve_text")
+      )
+    )
+  ),
+
+  tabPanel("Report",
+    sidebarLayout(
+      sidebarPanel(
+        textInput("proj_name", "Project name", "QTL_Design_Run"),
+        downloadButton("dl_report", "Download parameter summary (txt)")
+      ),
+      mainPanel(
+        h4("Export contents"),
+        p("Export includes: key parameters, analytic/simulation highlights, dPower/dn threshold & suggestions.")
+      )
+    )
+  )
+)
+
+# -----------------------------
+# SERVER
+# -----------------------------
+server <- function(input, output, session) {
+
+  G_raw  <- reactiveVal(NULL)
+  G_filt <- reactiveVal(NULL)
+  G_step_missing <- reactiveVal(NULL)
+
+  fallback_demo <- reactive({
+    genotype_sim_realistic(n = 200, m = 400, seed = 1)
+  })
+
+  # Robust active matrix (fallback to demo when empty)
+  G_active <- reactive({
+    Gcand <- if (isTRUE(input$apply_filters_downstream) && !is.null(G_filt())) {
+      G_filt()
+    } else if (!is.null(G_step_missing())) {
+      G_step_missing()
+    } else if (!is.null(G_raw())) {
+      G_raw()
+    } else {
+      NULL
+    }
+    if (is.null(Gcand) || nrow(Gcand) < 2 || ncol(Gcand) < 1) return(fallback_demo())
+    Gcand
+  })
+
+  # --- Data events ---
+  observeEvent(input$btn_gen, {
+    if (isTRUE(input$demo_realistic)) {
+      G <- genotype_sim_realistic(n = input$n_ind, m = input$m_mark, maf_center = input$maf, seed = 1)
+    } else {
+      G <- genotype_sim(n = input$n_ind, m = input$m_mark, maf = input$maf)
+    }
+    G_raw(G); G_step_missing(NULL); G_filt(NULL)
+  }, ignoreInit = TRUE)
+
+  observeEvent(input$geno_file, {
+    req(input$geno_file)
+    df <- fread(input$geno_file$datapath)
+    G  <- as.matrix(df)
+    if (!all(G %in% c(0,1,2, NA))) {
+      showNotification("Non 0/1/2 encoding detected; please use additive 0/1/2 coding (NA allowed).", type = "error")
+      return(NULL)
+    }
+    G_raw(G); G_step_missing(NULL); G_filt(NULL)
+  }, ignoreInit = TRUE)
+
+  observeEvent(input$btn_missing_apply, {
+    G0 <- G_raw()
+    if (is.null(G0)) { showNotification("No raw genotype available. Use demo or upload.", type = "warning"); return(NULL) }
+    G1 <- apply_missing_action(G0, mode = input$missing_mode)
+    G_step_missing(G1); G_filt(NULL)
+  }, ignoreInit = TRUE)
+
+  qc_results <- eventReactive(input$btn_qc, {
+    G0 <- if (!is.null(G_step_missing())) G_step_missing() else G_raw()
+    if (is.null(G0)) G0 <- fallback_demo()
+    qc0 <- compute_qc(G0)
+    G1 <- apply_filters(G0, max_miss_mark = input$f_miss_mark/100,
+                             max_miss_ind  = input$f_miss_ind/100,
+                             maf_min       = input$f_maf_min)
+    qc1 <- compute_qc(G1)
+    G_filt(G1)
+    list(G0=G0, qc0=qc0, G1=G1, qc1=qc1)
+  }, ignoreInit = TRUE)
+
+  # --- Data outputs ---
+  output$geno_head <- renderDT({
+    G <- if(!is.null(G_raw())) G_raw() else fallback_demo()
+    datatable(as.data.table(G[1:min(10, nrow(G)), 1:min(10, ncol(G))]), options = list(scrollX = TRUE))
+  })
+
+  output$dim_maf_summary <- renderText({
+    G0 <- if(!is.null(G_raw())) G_raw() else fallback_demo()
+    qc0 <- compute_qc(G0)
+    txt <- glue("Raw (or fallback): N x M = {nrow(G0)} x {ncol(G0)} | Median MAF = {round(median(qc0$maf, na.rm=TRUE),3)}")
+    if (!is.null(G_step_missing())) {
+      Gm <- G_step_missing(); qcm <- compute_qc(Gm)
+      txt <- paste0(txt, "\n", glue("After missing-handling: N x M = {nrow(Gm)} x {ncol(Gm)} | Median MAF = {round(median(qcm$maf, na.rm=TRUE),3)}"))
+    }
+    if (!is.null(G_filt())) {
+      G1 <- G_filt(); qc1 <- compute_qc(G1)
+      txt <- paste0(txt, "\n", glue("Filtered: N x M = {nrow(G1)} x {ncol(G1)} | Median MAF = {round(median(qc1$maf, na.rm=TRUE),3)}"))
+    }
+    txt
+  })
+
+  output$maf_hist <- renderPlot({
+    G <- if(!is.null(G_raw())) G_raw() else fallback_demo()
+    df <- data.frame(MAF = compute_qc(G)$maf)
+    ggplot(df, aes(MAF)) + geom_histogram(bins = 40, na.rm = TRUE) +
+      theme_minimal() + labs(title="MAF distribution (raw)", x="MAF", y="Count")
+  })
+
+  output$miss_mark_hist <- renderPlot({
+    G <- if(!is.null(G_raw())) G_raw() else fallback_demo()
+    df <- data.frame(miss = compute_qc(G)$miss_mark * 100)
+    ggplot(df, aes(miss)) + geom_histogram(bins = 40, na.rm = TRUE) +
+      theme_minimal() + labs(title="Marker missingness (%)", x="%", y="Count")
+  })
+
+  output$miss_ind_hist <- renderPlot({
+    G <- if(!is.null(G_raw())) G_raw() else fallback_demo()
+    df <- data.frame(miss = compute_qc(G)$miss_ind * 100)
+    ggplot(df, aes(miss)) + geom_histogram(bins = 40, na.rm = TRUE) +
+      theme_minimal() + labs(title="Individual missingness (%)", x="%", y="Count")
+  })
+
+  output$missing_action_summary <- renderText({
+    if (is.null(G_raw())) return("Missing-data handling: waiting for raw genotype (or use demo).")
+    mode <- switch(input$missing_mode,
+                   impute = "Impute by column mean",
+                   drop_rows_with_na = "Drop rows with any NA",
+                   drop_cols_with_na = "Drop columns with any NA",
+                   none = "Do nothing")
+    glue("Selected missing-data handling: {mode}. Click 'Apply' to effect.")
+  })
+
+  output$qc_summary <- renderText({
+    G0 <- if(!is.null(G_raw())) G_raw() else fallback_demo()
+    qc0 <- compute_qc(G0)
+    msg <- c(glue("Raw (or fallback): N x M = {nrow(G0)} x {ncol(G0)}; median MAF = {round(median(qc0$maf,na.rm=TRUE),3)};"),
+             glue("Low-diversity markers (MAF<0.05): {round(mean(qc0$maf<0.05, na.rm=TRUE),3)}"))
+    if (!is.null(G_filt())) {
+      G1 <- G_filt(); qc1 <- compute_qc(G1)
+      msg <- c(msg,
+        glue("Filtered: N x M = {nrow(G1)} x {ncol(G1)}; median MAF = {round(median(qc1$maf,na.rm=TRUE),3)};"),
+        glue("Low-diversity markers (MAF<0.05): {round(mean(qc1$maf<0.05, na.rm=TRUE),3)}"),
+        glue("Bonferroni alpha/M: {input$alpha}/{ncol(G0)} -> {input$alpha}/{ncol(G1)}")
+      )
+    }
+    paste(msg, collapse = "\n")
+  })
+
+  # ---------------- Model page ----------------
+  model_fit_res <- eventReactive(input$btn_model_fit, {
+    G <- G_active()
+    qidx <- safe_index(input$qtl_idx_model, ncol(G), default = 1L)
+
+    # mean-impute the chosen QTL column to avoid NA in simulate_trait_gaussian
+    G_use <- G
+    cm <- mean(G_use[, qidx], na.rm = TRUE); if (!is.finite(cm)) cm <- 0
+    na_rows <- which(is.na(G_use[, qidx])); if (length(na_rows)) G_use[na_rows, qidx] <- cm
+
+    beta <- input$beta_eff_model
+    y <- simulate_trait_gaussian(G_use, qtl_index = qidx, beta = beta, h2 = 0.2, seed = 123)
+
+    scan <- single_marker_scan(G_use, y)
+    list(G = G_use, y = y, scan = scan, qidx = qidx)
+  }, ignoreInit = TRUE)
+
+  output$model_summary <- renderText({
+    res <- model_fit_res()
+    G <- res$G; qidx <- res$qidx; p <- res$scan$p; tstats <- res$scan$t
+    alpha_eff <- effective_alpha(input$alpha, ncol(G), input$alpha_method)
+    passed <- isTRUE(p[qidx] < alpha_eff)
+    p_show <- if (is.finite(p[qidx])) signif(p[qidx], 3) else NA
+    t_show <- if (is.finite(tstats[qidx])) round(tstats[qidx], 3) else NA
+    glue("Model: {input$model_type}; alpha={input$alpha} ({input$alpha_method}), effective alpha={signif(alpha_eff,3)}\n",
+         "N x M = {nrow(G)} x {ncol(G)}; selected marker = {qidx}\n",
+         "Observed t = {t_show}, p = {p_show}; ",
+         if (passed) 'PASS genome-wide threshold' else 'NOT significant at genome-wide level')
+  })
+
+  output$t_plot <- renderPlot({
+    res <- model_fit_res()
+    cc <- complete.cases(res$y, res$G[, res$qidx])
+    n_eff <- sum(cc); df <- max(1, n_eff - 2)
+    alpha_eff <- effective_alpha(input$alpha, ncol(res$G), input$alpha_method)
+    alpha_eff <- min(max(alpha_eff, 1e-12), 0.999999)
+    tcrit <- qt(1 - alpha_eff/2, df = df)
+    t_obs <- res$scan$t[res$qidx]; if (!is.finite(t_obs)) t_obs <- 0
+    xs <- seq(-4*max(1,abs(tcrit)), 4*max(1,abs(tcrit)), length.out = 1000)
+    dens <- dt(xs, df = df)
+    ggplot(data.frame(x=xs, y=dens), aes(x,y)) +
+      geom_line() +
+      geom_vline(xintercept = c(-tcrit, tcrit), linetype = "dashed") +
+      geom_vline(xintercept = t_obs, linetype = "solid") +
+      theme_minimal() +
+      labs(title = glue("t-distribution (df={df}); dashed=±t_crit, solid=t_obs"),
+           x = "t", y = "density")
+  })
+
+  # ---------------- Power page (fast/slow sim + progress) ----------------
+  power_df <- eventReactive(input$btn_run, {
+    tryCatch({
+      G <- G_active(); req(G)
+
+      M <- ncol(G); N <- nrow(G)
+      qidx <- safe_index(input$qtl_idx, M, default = 1L)
+      n_range <- safe_n_grid(input$n_grid, input$grid_step, N)
+
+      beta  <- if (is.finite(input$beta_eff)) input$beta_eff else 0.2
+      alpha <- if (is.finite(input$alpha)) input$alpha else 0.05
+      method <- if (is.null(input$alpha_method)) "bonferroni" else input$alpha_method
+      rc2 <- if (is.finite(input$rc2)) input$rc2 else 0
+
+      alpha_eff <- effective_alpha(alpha, M, method)
+
+      # Robust maf (fallback to 0.25)
+      if (M >= 1) {
+        p_hat <- mean(colMeans(G, na.rm = TRUE) / 2)
+        maf <- pmin(p_hat, 1 - p_hat)
+        if (!is.finite(maf) || maf <= 0) maf <- 0.25
+      } else {
+        maf <- 0.25
+      }
+
+      pwr_a <- sapply(n_range, function(n)
+        power_analytic_single_marker(n, beta, maf, alpha_eff, rc2 = rc2, sigma2 = 1))
+
+      B <- if (is.finite(input$B_sim)) input$B_sim else 200
+
+      # progress bar & fast/slow switch
+      pwr_s <- withProgress(message = "Running simulation", value = 0, {
+        res <- numeric(length(n_range))
+        for (i in seq_along(n_range)) {
+          n_i <- n_range[i]
+          if (isTRUE(input$fast_sim)) {
+            res[i] <- power_simulate_qtl_only(G, qtl_index = qidx, beta = beta, n = n_i,
+                                              B = B, alpha = alpha, alpha_method = method)
+          } else {
+            res[i] <- power_simulate(G, qtl_index = qidx, beta = beta, n = n_i,
+                                     B = B, alpha = alpha, alpha_method = method)
+          }
+          incProgress(1/length(n_range),
+                      detail = sprintf("n = %d (%d/%d)", n_i, i, length(n_range)))
+        }
+        res
+      })
+
+      data.frame(n = n_range, power_analytic = pwr_a, power_sim = pwr_s)
+    }, error = function(e) {
+      showNotification(paste("Power analysis failed:", conditionMessage(e)),
+                       type = "error", duration = 8)
+      data.frame(n = integer(0), power_analytic = numeric(0), power_sim = numeric(0))
+    })
+  })
+
+  output$power_plot <- renderPlot({
+    df <- power_df()
+    if (nrow(df) == 0) {
+      plot.new(); title("Power analysis did not return data.\nCheck Data/QC settings or try demo.")
+      return(invisible())
+    }
+    ggplot(df, aes(n)) +
+      geom_line(aes(y = power_analytic), linetype = "dashed") +
+      geom_point(aes(y = power_sim)) +
+      labs(y = "Power", title = "Analytic (dashed) vs Simulation (points)") +
+      theme_minimal()
+  })
+
+  output$power_table <- renderDT({
+    df <- power_df()
+    if (nrow(df) == 0) {
+      return(datatable(data.frame(Note = "No power results. Adjust inputs and click Run."),
+                       options = list(dom='t')))
+    }
+    datatable(df, options = list(pageLength = 10))
+  })
+
+  # ---------------- Derivative ----------------
+  output$deriv_plot <- renderPlot({
+    df <- power_df(); req(df)
+    d <- dpower_dn_fd(df$n, df$power_sim)
+    ggplot(data.frame(n=df$n, dpower=d), aes(n, dpower)) +
+      geom_line() +
+      geom_hline(yintercept = input$deriv_thresh, linetype = "dotted") +
+      labs(y = "dPower/dn (finite diff)", title = "Marginal gain curve") +
+      theme_minimal()
+  })
+
+  output$stop_msg <- renderText({
+    df <- power_df(); req(df)
+    d <- dpower_dn_fd(df$n, df$power_sim)
+    below <- which(d <= input$deriv_thresh)
+    if (length(below) == 0) "No stopping threshold triggered within the current grid."
+    else glue("Suggested stopping point: n ≈ {df$n[min(below)]} (dPower/dn ≤ {input$deriv_thresh})")
+  })
+
+  # ---------------- Solver (FAST by default, fallback to slow) ----------------
+  solve_res <- eventReactive(input$btn_solve, {
+    tryCatch({
+      G <- G_active(); req(G)
+      qidx <- safe_index(input$qtl_idx, ncol(G), default = 1L)
+
+      # Prefer fast solver with progress
+      solve_n_for_power_fast(
+        G, qtl_index = qidx, beta = input$beta_eff,
+        target = input$target_power,
+        n_min = input$solve_min, n_max = input$solve_max,
+        alpha = input$alpha, alpha_method = input$alpha_method,
+        B = input$B_solve, seed = 321
+      )
+    }, error = function(e) {
+      # Fallback to slow solver if fast solver fails
+      showNotification(paste("Fast solver failed, falling back to slow mode:", conditionMessage(e)),
+                       type = "warning", duration = 8)
+      G <- G_active(); req(G)
+      qidx <- safe_index(input$qtl_idx, ncol(G), default = 1L)
+      solve_n_for_power(
+        G, qtl_index = qidx, beta = input$beta_eff,
+        target = input$target_power,
+        n_min = input$solve_min, n_max = input$solve_max,
+        alpha = input$alpha, alpha_method = input$alpha_method,
+        B = input$B_solve, seed = 321
+      )
+    })
+  })
+
+  output$solve_text <- renderText({
+    res <- solve_res(); req(res)
+    glue("Minimum sample size n* = {res$n}\nSimulation-confirmed power ≈ {round(res$power,3)}")
+  })
+
+  # ---------------- Report ----------------
+  output$dl_report <- downloadHandler(
+    filename = function() paste0(input$proj_name, "_summary.txt"),
+    content = function(file) {
+      G <- G_active()
+      txt <- c(
+        glue("Project: {input$proj_name}"),
+        glue("N x M: {nrow(G)} x {ncol(G)}"),
+        glue("Model: {input$model_type}, alpha={input$alpha}, mult={input$alpha_method}, Rc2={input$rc2}"),
+        glue("QTL idx={input$qtl_idx}, beta={input$beta_eff}"),
+        glue("n grid: {paste(seq(input$n_grid[1], input$n_grid[2], by = input$grid_step), collapse=', ')}"),
+        glue("B(sim)={input$B_sim}, dPower/dn stop={input$deriv_thresh}"),
+        glue("Target power={input$target_power} (solver bounds {input$solve_min}-{input$solve_max})")
+      )
+      writeLines(txt, con = file)
+    }
+  )
+
+  # References modal
+  observeEvent(input$btn_refs, {
+    dat <- data.frame(
+      Topic = c("Multiple testing (FDR)", "LMM for population structure"),
+      Citation = c("Benjamini & Hochberg (1995) JRSS-B", "Kang et al. (2010) EMMAX; Lippert et al. (2011) FaST-LMM"),
+      Link = c("https://doi.org/10.1111/j.2517-6161.1995.tb02031.x", "https://doi.org/10.1038/ng.548"),
+      stringsAsFactors = FALSE
+    )
+    showModal(modalDialog(
+      title = "References",
+      DTOutput("refs_table"),
+      easyClose = TRUE, size = "l", footer = NULL
+    ))
+    output$refs_table <- renderDT({
+      dat$Link <- sprintf("<a href='%s' target='_blank'>link</a>", dat$Link)
+      datatable(dat, escape = FALSE, options = list(pageLength = 10))
+    })
+  })
+}
+
+shinyApp(ui, server)
+
+```
+
