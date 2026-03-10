@@ -1,0 +1,229 @@
+---
+title: "From Classical Single-Marker QTL Mapping to Multi-Marker Shrinkage: Analysis and Simulation Using Cotton MAGIC Genotypes"
+author: "Shiyan Miao"
+date: today
+format:
+  pdf:
+    documentclass: article
+    toc: true
+    number-sections: true
+    colorlinks: true
+    geometry:
+      - margin=1in
+execute:
+  echo: true
+  warning: false
+  message: false
+editor: visual
+---
+
+# Introduction
+
+This report develops an analysis and simulation workflow for cotton genotype and phenotype data downloaded from the CSIRO collection. The workflow is designed to connect the classical QTL mapping literature with a modern high-dimensional biostatistical analysis strategy. The theoretical starting point is the classical regression-based QTL mapping tradition associated with single-marker and interval-based approaches, especially Haley and Knott's regression approximation and Broman's broader framework of QTL detection, interval mapping, and multiple-QTL model selection. The empirical motivation is that the present dataset is not a simple textbook backcross or F2 dataset, but a more realistic high-dimensional marker dataset with multiple phenotypic measurements across seasons. Therefore, this report treats single-marker regression as a baseline and uses penalised multi-marker methods as the main analysis framework.
+
+The goals of the report are fourfold. First, it describes the structure of the genotype, map, and phenotype data. Second, it performs basic quality checks and descriptive summaries. Third, it conducts a baseline single-marker scan for each trait while controlling for seasonal variation. Fourth, it proposes an anchored simulation framework that preserves the real genotype architecture and uses simulated phenotypes to compare the performance of alternative QTL detection methods under varying numbers of causal loci, signal strengths, and seasonal effects.
+
+# Theoretical Framework
+
+## Classical QTL mapping logic
+
+The literature review established a progression from traditional phenotypic selection to marker-assisted selection, and from there to QTL detection as the statistical foundation of marker-assisted selection. In the classical framework, a marker is useful not because it is necessarily causal, but because it carries information about an unobserved functional locus or QTL through linkage. Under simple crossing designs, such as backcross or F2 populations, marker genotype differences can be translated into phenotypic mean differences, and those differences can be analysed through regression.
+
+Haley and Knott showed that QTL mapping can be approximated by a regression framework rather than relying only on full maximum-likelihood routines. Broman later situated this logic within a broader progression from marker-wise analysis to interval mapping, and then to multiple-QTL and model-selection frameworks. The key implication for the present project is that single-marker regression remains theoretically useful as a baseline, but it is insufficient for realistic high-dimensional marker data in which marker correlation, linkage disequilibrium, and large $p$ relative to $n$ are central concerns.
+
+## Why the present dataset requires a modern extension
+
+The CSIRO cotton dataset contains thousands of markers but only a few hundred lines. This creates a high-dimensional setting in which multi-marker methods are more appropriate than purely classical single-marker scans. The literature review already identified this issue in its discussion of multiple marker models, collinearity, and shrinkage methods. Accordingly, the present report adopts the following analytical logic:
+
+1.  Use single-marker regression as a transparent classical baseline.
+2.  Use penalised multi-marker regression as the main modern analysis framework.
+3.  Use simulation anchored on the real genotype matrix to evaluate how different methods behave under realistic marker correlation structures.
+
+# Data and Setup
+
+## Required packages
+
+```{r}
+library(tidyverse)
+library(data.table)
+library(glmnet)
+library(broom)
+library(janitor)
+library(patchwork)
+library(Matrix)
+```
+
+## File paths
+
+```{r}
+geno_file <- "Genotype_data.txt"
+map_file  <- "Genetic_map.txt"
+pheno_file <- "Phenotype_data.txt"
+```
+
+## Import data
+
+```{r}
+geno_raw <- fread(geno_file, header = FALSE)
+map_df <- fread(map_file)
+pheno_raw <- fread(pheno_file)
+```
+
+## Inspect dimensions
+
+```{r}
+dim(geno_raw)
+dim(map_df)
+dim(pheno_raw)
+
+head(map_df)
+head(pheno_raw)
+```
+
+## Add marker names to the genotype matrix
+
+The genotype file has no column names. We use the SNP identifiers from the genetic map.
+
+```{r}
+stopifnot(ncol(geno_raw) == nrow(map_df))
+
+geno_df <- as.data.frame(geno_raw)
+colnames(geno_df) <- map_df$SNP_ID
+geno_df$Line <- 1:nrow(geno_df)
+
+geno_df[1:5, 1:8]
+```
+
+## 
+Construct line and season identifiers for phenotype data
+
+The phenotype file contains 768 rows, while the genotype matrix contains 256 lines. This strongly suggests that phenotype observations correspond to three stacked seasons or environments for the same 256 lines.
+
+```{r}
+n_lines <- nrow(geno_df)
+n_pheno <- nrow(pheno_raw)
+
+n_pheno / n_lines
+```
+
+If the phenotype observations are indeed stacked by season, then each block of 256 rows corresponds to one season.
+
+```{r}
+pheno_df <- pheno_raw %>%
+  mutate(
+    RowID = row_number(),
+    Season = case_when(
+      RowID <= n_lines ~ "Season_1",
+      RowID <= 2 * n_lines ~ "Season_2",
+      TRUE ~ "Season_3"
+    ),
+    Line = rep(1:n_lines, times = n_pheno / n_lines)
+  ) %>%
+  relocate(Line, Season, RowID)
+
+head(pheno_df)
+tail(pheno_df)
+```
+
+## Merge phenotype and genotype
+
+```{r}
+analysis_df <- pheno_df %>%
+  left_join(geno_df, by = "Line")
+
+dim(analysis_df)
+```
+
+# Descriptive Analysis
+
+## Trait names
+
+```{r}
+trait_names <- c(
+  "Lint_percentage",
+  "Seed_index",
+  "Lint_index",
+  "Seed_oil_content"
+)
+```
+
+## Summary statistics
+
+```{r}
+trait_summary <- analysis_df %>%
+  summarise(across(all_of(trait_names), list(
+    mean = ~mean(.x, na.rm = TRUE),
+    sd = ~sd(.x, na.rm = TRUE),
+    min = ~min(.x, na.rm = TRUE),
+    max = ~max(.x, na.rm = TRUE)
+  )))
+
+trait_summary
+```
+
+## Season-specific summaries
+
+```{r}
+season_summary <- analysis_df %>%
+  group_by(Season) %>%
+  summarise(across(all_of(trait_names), list(
+    mean = ~mean(.x, na.rm = TRUE),
+    sd = ~sd(.x, na.rm = TRUE)
+  )), .groups = "drop")
+
+season_summary
+```
+
+## Trait distributions
+
+```{r}
+plot_trait_density <- function(df, trait) {
+  ggplot(df, aes(x = .data[[trait]], fill = Season)) +
+    geom_density(alpha = 0.4) +
+    labs(
+      title = paste("Distribution of", trait, "by season"),
+      x = trait,
+      y = "Density"
+    ) +
+    theme_minimal()
+}
+
+plots_density <- lapply(trait_names, function(tr) plot_trait_density(analysis_df, tr))
+
+plots_density[[1]]
+plots_density[[2]]
+plots_density[[3]]
+plots_density[[4]]
+```
+
+## Trait boxplots by season
+
+```{r}
+plot_trait_box <- function(df, trait) {
+  ggplot(df, aes(x = Season, y = .data[[trait]], fill = Season)) +
+    geom_boxplot(alpha = 0.8) +
+    labs(
+      title = paste("Boxplot of", trait, "by season"),
+      x = "Season",
+      y = trait
+    ) +
+    theme_minimal()
+}
+
+plots_box <- lapply(trait_names, function(tr) plot_trait_box(analysis_df, tr))
+
+plots_box[[1]]
+plots_box[[2]]
+plots_box[[3]]
+plots_box[[4]]
+```
+
+## Correlation among traits
+
+```{r}
+trait_cor <- analysis_df %>%
+  select(all_of(trait_names)) %>%
+  cor(use = "pairwise.complete.obs")
+
+trait_cor
+```
