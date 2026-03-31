@@ -1,0 +1,1360 @@
+---
+title: "Draft bullet points"
+author: "Shiyan Miao"
+date: today
+format:
+  pdf:
+    documentclass: article
+    toc: true
+    lof: true
+    lot: true
+    colorlinks: true
+    geometry:
+      - margin=1in
+execute:
+  echo: false
+  warning: false
+  message: false
+editor: visual
+---
+
+```{r}
+library(tidyverse)
+library(data.table)
+library(glmnet)
+library(broom)
+library(knitr)
+library(scales)
+library(irlba)
+
+knitr::opts_chunk$set(
+  fig.align = "center",
+  fig.width = 8,
+  fig.height = 5,
+  out.width = "90%"
+)
+```
+
+```{r}
+geno_file  <- "Genotype_data.txt"
+map_file   <- "Genetic_map.txt"
+pheno_file <- "Phenotype_data.txt"
+```
+
+# 1. Overview
+
+This report develops an analysis workflow for cotton genotype and phenotype data downloaded from the CSIRO collection. The purpose of the report is to connect the classical QTL mapping literature with a modern high-dimensional statistical framework. In the classical literature, QTL mapping is built on the idea that genetic markers are useful because they provide information about nearby functional loci through linkage. In simple mapping populations, marker differences can be translated into phenotypic mean differences and analysed through regression. Haley and Knott showed that QTL effects can be approximated using regression methods, while Broman later placed this logic in a broader framework that includes single-marker analysis, interval mapping, and multiple-QTL model selection. For the present project, this literature implies that single-marker regression is still useful as a transparent baseline, but it is not sufficient for realistic high-dimensional marker data where marker correlation and the large-$p$, small-$n$ problem are central.
+
+The present dataset requires this modern extension because it contains many more markers than genotyped lines. In the draft report, the genotype file contains 256 lines and 6,523 marker columns, while the phenotype file contains 768 observations, which implies repeated measurements across three seasons. This is not a simple textbook backcross or F2 design. Instead, it is a more realistic dataset with dense markers, repeated trait records, and likely marker dependence. For this reason, the report adopts a layered strategy. It begins with classical single-marker regression, then evaluates broad genotype structure using principal component analysis (PCA), and finally moves to penalised multi-marker modelling through lasso. The report therefore treats single-marker regression as a baseline and shrinkage-based modelling as the main modern framework.
+
+The goals of the report are fourfold. First, it describes the structure of the genotype, map, and phenotype data. Second, it performs descriptive summaries and basic empirical checks. Third, it compares baseline single-marker scans with and without PCA adjustment for genotype structure. Fourth, it uses lasso as a more parsimonious multi-marker method, which is closer to the type of modelling needed for later simulation-based comparison work. In this sense, the report is both substantive and methodological: it studies the cotton traits themselves, but it also builds the statistical foundation for later simulation and method evaluation.
+
+## 2.1. Data inputs
+
+```{r}
+geno_raw  <- fread(geno_file, header = FALSE)
+map_df    <- fread(map_file)
+pheno_raw <- fread(pheno_file)
+
+data_overview <- tibble(
+  Object = c("geno_raw", "map_df", "pheno_raw"),
+  Rows = c(nrow(geno_raw), nrow(map_df), nrow(pheno_raw)),
+  Columns = c(ncol(geno_raw), ncol(map_df), ncol(pheno_raw))
+)
+
+knitr::kable(
+  data_overview,
+  caption = "Overview of imported genotype, map, and phenotype files."
+)
+```
+
+**Table 1** shows the basic dimensions of the three imported data objects. The genotype object (`geno_raw`) has 256 rows and 6,523 columns. This means there are 256 cotton lines and 6,523 marker measurements. The map object (`map_df`) has 6,523 rows and 3 columns, which means each genotype column can be matched to map information such as marker identity or position. The phenotype object (`pheno_raw`) has 768 rows and 4 columns, which is much larger in the row dimension than the genotype object. This already suggests repeated phenotype observations for the same lines rather than one phenotype record per line. Overall, Table 1 establishes the key empirical fact of the project: the study is high-dimensional on the genotype side, because the number of markers is far larger than the number of genotyped lines. This is exactly the kind of setting where classical low-dimensional regression logic becomes strained and where modern regularised methods become important.
+
+## 2.2. Marker and phenotype structure
+
+```{r}
+stopifnot(ncol(geno_raw) == nrow(map_df))
+
+geno_df <- as.data.frame(geno_raw)
+colnames(geno_df) <- map_df$SNP_ID
+geno_df$Line <- 1:nrow(geno_df)
+
+n_lines <- nrow(geno_df)
+n_pheno <- nrow(pheno_raw)
+
+pheno_df <- pheno_raw %>%
+  mutate(
+    RowID = row_number(),
+    Season = case_when(
+      RowID <= n_lines ~ "Season_1",
+      RowID <= 2 * n_lines ~ "Season_2",
+      TRUE ~ "Season_3"
+    ),
+    Line = rep(1:n_lines, times = n_pheno / n_lines)
+  ) %>%
+  relocate(Line, Season, RowID)
+
+structure_overview <- tibble(
+  Quantity = c(
+    "Genotype lines",
+    "Phenotype rows",
+    "Implied seasons/environments"
+  ),
+  Value = c(
+    n_lines,
+    n_pheno,
+    n_pheno / n_lines
+  )
+)
+
+knitr::kable(
+  structure_overview,
+  caption = "Reconstructed line and season structure from the imported files."
+)
+```
+
+**Table 2** reconstructs the basic line and season structure. The genotype file contains 256 lines, the phenotype file contains 768 rows, and the ratio implies 3 seasons or environments. This is an important step because the raw phenotype file alone does not explicitly provide a simple one-row-per-line structure. By reconstructing the design in this way, the report makes it possible to align each phenotype record with a genotype line and a season indicator. The table therefore does more than provide descriptive information; it defines the data structure needed for all later modelling. It also makes clear that seasonal or environmental variation cannot be ignored, because each line appears repeatedly across conditions.
+
+The genotype matrix contains one row per line, while the phenotype file stacks repeated observations across seasons or environments. Because the phenotype file has three times as many rows as the genotype matrix, the working assumption is that the phenotype observations correspond to three stacked seasons for the same set of lines.
+
+The paragraph after Table 2 correctly explains the working assumption: the phenotype observations are stacked by season for the same 256 lines. This assumption is methodologically important. Without it, the analysis would mix repeated measures and genetic effects in an unclear way. With it, the report can explicitly control for season in regression models and later ask whether marker effects are robust after this adjustment.
+
+```{r}
+analysis_df <- pheno_df %>%
+  left_join(geno_df, by = "Line")
+
+merge_tbl <- tibble(
+  Object = "analysis_df",
+  Rows = nrow(analysis_df),
+  Columns = ncol(analysis_df)
+)
+
+knitr::kable(
+  merge_tbl,
+  caption = "Dimensions of the merged phenotype-genotype analysis dataset."
+)
+```
+
+**Table 3** reports the dimensions of the merged dataset, `analysis_df`, which has 768 rows and 6,530 columns. The row count confirms that all phenotype observations were kept after merging, while the column count shows that the merged object contains phenotype variables, season identifiers, line identifiers, and the full marker matrix. This merged table is the operational dataset used in the remainder of the report. It is also a useful quality check: if the merge had gone wrong, the row count would likely have changed, or many rows would have missing genotype information. Instead, Table 3 suggests that the phenotype and genotype data were joined in a consistent way.
+
+## 2.3. Trait summaries
+
+```{r}
+trait_names <- c(
+  "Lint_percentage",
+  "Seed_index",
+  "Lint_index",
+  "Seed_oil_content"
+)
+```
+
+```{r}
+trait_summary <- analysis_df %>%
+  summarise(across(
+    all_of(trait_names),
+    list(
+      mean = ~mean(.x, na.rm = TRUE),
+      sd   = ~sd(.x, na.rm = TRUE),
+      min  = ~min(.x, na.rm = TRUE),
+      max  = ~max(.x, na.rm = TRUE)
+    )
+  ))
+
+knitr::kable(
+  trait_summary,
+  digits = 3,
+  caption = "Overall summary statistics for the four analysed traits."
+)
+```
+
+**Table 4** reports overall summary statistics for the four analysed traits: lint percentage, seed index, lint index, and seed oil content. Lint percentage has a mean of about 42.45 and a standard deviation of 2.87, with values ranging from 30.7 to 49.4. Seed index has a mean of about 8.49 and a standard deviation of 0.98, with a range from 6.3 to 12.3. Lint index is less variable, with a mean of 7.61 and a standard deviation of 0.55. Seed oil content has a mean of 19.71 and a standard deviation of 1.79, with a wider range from 15.2 to 26.9. These numbers show that all four traits vary across observations, but the scale and spread differ. Lint percentage and seed oil content show substantial variation, while lint index is more tightly distributed. This matters for QTL analysis because traits with different scales and variances may produce different signal-to-noise ratios and different numbers of detected markers.
+
+```{r}
+season_summary <- analysis_df %>%
+  group_by(Season) %>%
+  summarise(across(
+    all_of(trait_names),
+    list(
+      mean = ~mean(.x, na.rm = TRUE),
+      sd   = ~sd(.x, na.rm = TRUE)
+    )
+  ), .groups = "drop")
+
+knitr::kable(
+  season_summary,
+  digits = 3,
+  caption = "Season-specific mean and standard deviation for each trait."
+)
+```
+
+**Table 5** shows season-specific means and standard deviations. This table is one of the most important descriptive outputs in the report because it shows clear seasonal shifts in trait levels. Lint percentage is much lower in Season 1 (39.50) than in Season 2 (43.91) and Season 3 (43.93). Seed index shows the opposite pattern: it is highest in Season 1 (9.59) and then falls in Season 2 (8.15) and again in Season 3 (7.73). Lint index is comparatively stable across the three seasons, with means between 7.54 and 7.66. Seed oil content is lowest in Season 2 (18.38), slightly higher in Season 1 (19.07), and clearly highest in Season 3 (21.68). These patterns show that seasonal effects are not small background noise. They are strong enough to shift trait means in meaningful ways, especially for lint percentage, seed index, and seed oil content. This directly justifies the modelling choice to include season as a control in all baseline regression analyses.
+
+```{r}
+trait_cor <- analysis_df %>%
+  select(all_of(trait_names)) %>%
+  cor(use = "pairwise.complete.obs")
+
+knitr::kable(
+  round(trait_cor, 3),
+  caption = "Correlation matrix among the analysed phenotypic traits."
+)
+```
+
+**Table 6** reports the correlation matrix among the four phenotypic traits. The strongest relationship is the negative correlation between lint percentage and seed index ($-0.778$). This suggests a strong trade-off: lines with higher lint percentage tend to have lower seed index. Lint percentage and lint index are positively correlated ($0.354$), which is moderate and biologically intuitive because both traits are related to lint performance. Seed index and seed oil content are negatively correlated ($-0.277$), although this relationship is weaker than the lint percentage–seed index relationship. The remaining correlations are small, especially those involving seed oil content with lint percentage ($0.057$) and lint index ($-0.072$). Overall, Table 6 suggests that the four traits are not statistically redundant. Some traits share moderate relationships, but they are not simply measuring the same underlying dimension. This is important because it supports analysing the traits separately rather than assuming that one common genetic architecture will explain all of them.
+
+```{r}
+plot_trait_density <- function(df, trait) {
+  ggplot(df, aes(x = .data[[trait]], fill = Season)) +
+    geom_density(alpha = 0.4) +
+    labs(
+      title = paste("Distribution of", trait, "by season"),
+      x = trait,
+      y = "Density"
+    ) +
+    theme_minimal(base_size = 12)
+}
+
+density_plots <- lapply(trait_names, function(tr) plot_trait_density(analysis_df, tr))
+density_plots[[1]]
+density_plots[[2]]
+density_plots[[3]]
+density_plots[[4]]
+```
+
+The density plots for the four traits reinforce the same message from Table 5 but in a more visual way. For lint percentage, the Season 1 distribution is visibly shifted to the left, while Seasons 2 and 3 are shifted to the right and overlap strongly. This means the lower mean for Season 1 is not caused by only a few extreme observations; instead, the whole distribution is lower. For seed index, Season 1 is shifted to higher values and Season 3 is shifted to lower values, again showing a broad seasonal shift rather than a small number of outliers. For lint index, the three seasonal density curves overlap substantially, which confirms the earlier conclusion that seasonal change in this trait is relatively small. For seed oil content, Season 3 is clearly shifted to higher values than the other two seasons. Taken together, the density plots show that season changes the central location of several traits, and in some cases it also changes the spread of observations.
+
+```{r}
+plot_trait_box <- function(df, trait) {
+  ggplot(df, aes(x = Season, y = .data[[trait]], fill = Season)) +
+    geom_boxplot(alpha = 0.8) +
+    labs(
+      title = paste("Boxplot of", trait, "by season"),
+      x = "Season",
+      y = trait
+    ) +
+    theme_minimal(base_size = 12)
+}
+
+box_plots <- lapply(trait_names, function(tr) plot_trait_box(analysis_df, tr))
+box_plots[[1]]
+box_plots[[2]]
+box_plots[[3]]
+box_plots[[4]]
+```
+
+The boxplots add another layer of interpretation because they show medians, interquartile ranges, and outliers. For lint percentage, the Season 1 median is much lower than the medians for Seasons 2 and 3, and Seasons 2 and 3 have very similar central positions. For seed index, the pattern is reversed, with Season 1 clearly highest. For lint index, the medians are close, and the boxes overlap strongly, which confirms that this trait is relatively stable across seasons. For seed oil content, the median in Season 3 is clearly above the medians in Seasons 1 and 2. The boxplots also show that outliers exist in all traits, but the main seasonal differences are not driven only by outliers. The boxes themselves are shifted. This is exactly the kind of evidence that supports season adjustment in later models.
+
+# 3. Statistical Methods
+
+## 3.1. Model specification and estimation
+
+```{r prepare-genotype-pca-and-model-objects}
+# Prepare genotype matrix for PCA and modelling
+X_geno <- geno_df %>%
+  select(-Line) %>%
+  as.matrix()
+
+mode(X_geno) <- "numeric"
+
+for (j in seq_len(ncol(X_geno))) {
+  miss_idx <- is.na(X_geno[, j])
+  if (any(miss_idx)) {
+    X_geno[miss_idx, j] <- mean(X_geno[, j], na.rm = TRUE)
+  }
+}
+
+# Remove zero-variance markers for downstream modelling stability
+marker_keep <- apply(X_geno, 2, function(x) var(x, na.rm = TRUE) > 0)
+X_geno <- X_geno[, marker_keep, drop = FALSE]
+marker_names <- colnames(X_geno)
+
+# Principal component analysis of genotype structure
+set.seed(123)
+pca_fit <- prcomp_irlba(
+  x = scale(X_geno, center = TRUE, scale = TRUE),
+  n = 20,
+  center = FALSE,
+  scale. = FALSE
+)
+
+var_explained <- (pca_fit$sdev^2) / sum(pca_fit$sdev^2)
+cum_var_explained <- cumsum(var_explained)
+
+pca_var_df <- tibble(
+  PC = seq_along(var_explained),
+  Variance_Explained = var_explained,
+  Cumulative = cum_var_explained
+)
+
+pca_scores <- as_tibble(pca_fit$x[, 1:5, drop = FALSE]) %>%
+  setNames(paste0("PC", 1:5)) %>%
+  mutate(Line = seq_len(n()))
+
+trait_line_mean <- pheno_df %>%
+  group_by(Line) %>%
+  summarise(
+    across(all_of(trait_names), ~mean(.x, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+pca_scores <- pca_scores %>%
+  left_join(trait_line_mean, by = "Line")
+
+pc_line_df <- pca_scores %>%
+  select(Line, PC1, PC2, PC3, PC4, PC5)
+
+analysis_df <- analysis_df %>%
+  select(-any_of(paste0("PC", 1:5))) %>%
+  left_join(pc_line_df, by = "Line") %>%
+  mutate(Season = factor(Season))
+```
+
+```{r pca-scree-plot}
+ggplot(pca_var_df, aes(x = PC, y = Variance_Explained)) +
+  geom_col() +
+  labs(
+    title = "Scree Plot for Genotype PCA",
+    x = "Principal Component",
+    y = "Proportion of Variance Explained"
+  ) +
+  theme_minimal(base_size = 14)
+```
+
+The scree plot shows the proportion of genotype variation explained by each of the first $20$ principal components. The main pattern is that the explained variance declines gradually rather than collapsing after the first one or two components. This means that the genotype matrix contains broad structure, but this structure is not dominated by a single very strong axis. In other words, the marker data are not organised around only one simple dimension. Instead, the genetic variation is spread across several components, which is consistent with a complex breeding population rather than a very simple two-group design. This is an important finding because it suggests that adjusting for only one component would likely be insufficient to account for broad genotype background.
+
+```{r pca-cumulative-variance}
+ggplot(pca_var_df, aes(x = PC, y = Cumulative)) +
+  geom_line() +
+  geom_point() +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(
+    title = "Cumulative Variance Explained",
+    x = "Principal Component",
+    y = "Cumulative Proportion"
+  ) +
+  theme_minimal(base_size = 14)
+```
+
+The cumulative variance plot supports the same conclusion from a different angle. The cumulative proportion increases steadily across the first $20$ components, instead of showing a very sharp early jump. This pattern implies that several PCs are needed to capture a meaningful share of the total genotype variation. Therefore, the decision to retain the first $5$ PCs for later modelling is methodologically reasonable: it captures broad genetic structure while keeping the adjusted model interpretable and computationally manageable. At the same time, the plot also suggests that PCA adjustment is only a partial correction, because the genotype matrix remains high-dimensional even after a small number of components is added to the regression model.
+
+```{r pca-scatterplots}
+ggplot(pca_scores, aes(x = PC1, y = PC2)) +
+  geom_point(alpha = 0.7) +
+  labs(
+    title = "Genotype PCA: PC1 vs PC2",
+    x = "PC1",
+    y = "PC2"
+  ) +
+  theme_minimal(base_size = 14)
+
+ggplot(pca_scores, aes(x = PC1, y = PC3)) +
+  geom_point(alpha = 0.7) +
+  labs(
+    title = "Genotype PCA: PC1 vs PC3",
+    x = "PC1",
+    y = "PC3"
+  ) +
+  theme_minimal(base_size = 14)
+```
+
+The scatterplot of $PC1$ against $PC2$ shows that the cotton lines are not distributed as one tight and homogeneous cloud. Instead, there is substantial spread across both axes, and some partial clustering is visible, especially along $PC1$. However, the points do not form a small number of sharply separated groups. This means that the genotype structure is real but moderate. In applied terms, there is enough structure to justify adjustment, but the population cannot be reduced to a very simple binary split. This is exactly the kind of situation in which PCA adjustment is useful as a way to control for broad background structure without claiming that the data come from completely distinct subpopulations.
+
+The scatterplot of $PC1$ against $PC3$ gives a similar message. Again, the lines show wide dispersion, and there is visible heterogeneity across the PC space. Compared with the $PC1$–$PC2$ plot, the $PC1$–$PC3$ plot suggests that some additional variation is captured by PC3PC3PC3, but this variation still does not separate the lines into a few isolated groups. Taken together, these two figures indicate that genotype structure is multi-dimensional. Therefore, using several PCs rather than a single component is more consistent with the observed data geometry.
+
+```{r pca-trait-structure-figures}
+ggplot(pca_scores, aes(x = PC1, y = PC2, colour = Lint_percentage)) +
+  geom_point(size = 2, alpha = 0.8) +
+  labs(
+    title = "PC1 vs PC2 coloured by average lint percentage",
+    x = "PC1",
+    y = "PC2",
+    colour = "Lint %"
+  ) +
+  theme_minimal(base_size = 14)
+
+pc_trait_df <- pca_scores %>%
+  select(Line, PC1, PC2, PC3, PC4, PC5,
+         Lint_percentage, Seed_index, Lint_index, Seed_oil_content)
+
+cor_mat <- pc_trait_df %>%
+  select(-Line) %>%
+  cor(use = "pairwise.complete.obs")
+
+cor_df <- as.data.frame(cor_mat) %>%
+  rownames_to_column("Var1") %>%
+  pivot_longer(-Var1, names_to = "Var2", values_to = "Correlation") %>%
+  filter(
+    Var1 %in% c("PC1", "PC2", "PC3", "PC4", "PC5"),
+    Var2 %in% c("Lint_percentage", "Seed_index", "Lint_index", "Seed_oil_content")
+  )
+
+ggplot(cor_df, aes(x = Var1, y = Var2, fill = Correlation)) +
+  geom_tile() +
+  geom_text(aes(label = round(Correlation, 2)), size = 5) +
+  scale_fill_gradient2(low = "darkblue", mid = "white", high = "darkred", midpoint = 0) +
+  labs(
+    title = "Correlation between top PCs and averaged traits",
+    x = NULL,
+    y = NULL
+  ) +
+  theme_minimal(base_size = 14)
+```
+
+The plot of $PC1$ against $PC2$ coloured by average lint percentage is useful because it links genotype structure with one focal phenotype. The colour pattern does not show a strong monotonic gradient across the full PC space. In other words, lines with higher lint percentage are not located only in one corner of the plot, and lines with lower lint percentage are not concentrated only in another corner. Instead, high and low values are mixed across much of the space. This suggests that average lint percentage is not simply a direct linear reflection of the first two genotype PCs. Therefore, broad genotype structure may influence the phenotype, but it does not fully determine it.
+
+This is substantively important for the modelling strategy. If lint percentage had followed a very strong PC gradient, then many marker signals could have been interpreted mainly as artefacts of broad structure. Instead, the figure suggests a weaker relationship. This implies that PCA adjustment is still useful as a robustness check, but it is unlikely to remove the entire signal for lint percentage. That expectation is later supported by the model comparison results, where lint percentage remains strongly associated with many markers even after PC adjustment.
+
+```{r model-helper-functions}
+prep_marker_matrix <- function(df, marker_names) {
+  df <- as.data.frame(df)
+
+  X <- as.matrix(df[, marker_names, drop = FALSE])
+  mode(X) <- "numeric"
+
+  if (anyNA(X)) {
+    col_means <- colMeans(X, na.rm = TRUE)
+    idx <- which(is.na(X), arr.ind = TRUE)
+    X[idx] <- col_means[idx[, 2]]
+  }
+
+  X
+}
+
+fast_single_marker_scan_cov <- function(df, trait, marker_names, covariates = "Season") {
+  df <- as.data.frame(df)
+
+  needed_cols <- unique(c(trait, covariates, marker_names))
+  df <- df[, needed_cols, drop = FALSE]
+
+  keep <- complete.cases(df[, c(trait, covariates), drop = FALSE])
+  df <- df[keep, , drop = FALSE]
+
+  y <- df[[trait]]
+  X <- prep_marker_matrix(df, marker_names)
+
+  cov_formula <- as.formula(
+    paste("~", paste(covariates, collapse = " + "))
+  )
+  C <- model.matrix(cov_formula, data = df)
+  qrC <- qr(C)
+
+  y_res <- qr.resid(qrC, y)
+  X_res <- qr.resid(qrC, X)
+
+  Sxx <- colSums(X_res^2)
+  Sxy <- as.vector(crossprod(X_res, y_res))
+  Syy <- sum(y_res^2)
+
+  df_resid <- nrow(df) - qrC$rank - 1
+  valid <- Sxx > 1e-12
+
+  beta <- rep(NA_real_, length(marker_names))
+  rss  <- rep(NA_real_, length(marker_names))
+  se   <- rep(NA_real_, length(marker_names))
+  tval <- rep(NA_real_, length(marker_names))
+  pval <- rep(NA_real_, length(marker_names))
+
+  beta[valid] <- Sxy[valid] / Sxx[valid]
+  rss[valid]  <- pmax(Syy - (Sxy[valid]^2 / Sxx[valid]), 0)
+  se[valid]   <- sqrt((rss[valid] / df_resid) / Sxx[valid])
+  tval[valid] <- beta[valid] / se[valid]
+  pval[valid] <- 2 * pt(abs(tval[valid]), df = df_resid, lower.tail = FALSE)
+
+  tibble(
+    trait = trait,
+    SNP_ID = marker_names,
+    estimate = beta,
+    std.error = se,
+    statistic = tval,
+    p.value = pval,
+    covariates = paste(covariates, collapse = " + "),
+    df_resid = df_resid
+  )
+}
+
+add_multiple_testing <- function(scan_df, alpha = 0.05) {
+  scan_df %>%
+    group_by(trait, covariates) %>%
+    arrange(p.value, .by_group = TRUE) %>%
+    mutate(
+      p_adj_bh   = p.adjust(p.value, method = "BH"),
+      p_adj_bonf = p.adjust(p.value, method = "bonferroni"),
+      sig_raw    = p.value < alpha,
+      sig_bh     = p_adj_bh < alpha,
+      sig_bonf   = p_adj_bonf < alpha
+    ) %>%
+    ungroup()
+}
+
+select_marker_set <- function(scan_df, trait_name, rule = c("bh", "bonf", "top"), top_n = 50) {
+  rule <- match.arg(rule)
+
+  df <- scan_df %>%
+    filter(trait == trait_name) %>%
+    arrange(p.value)
+
+  if (rule == "bh") {
+    return(df %>% filter(sig_bh) %>% pull(SNP_ID) %>% unique())
+  }
+
+  if (rule == "bonf") {
+    return(df %>% filter(sig_bonf) %>% pull(SNP_ID) %>% unique())
+  }
+
+  df %>% slice_head(n = top_n) %>% pull(SNP_ID) %>% unique()
+}
+
+run_lasso_trait_checked <- function(df, trait, marker_names,
+                                    covariates = c("Season", "PC1", "PC2", "PC3", "PC4", "PC5"),
+                                    alpha = 1,
+                                    nfolds = 10,
+                                    seed = 123) {
+  df <- as.data.frame(df)
+
+  keep <- complete.cases(df[, c(trait, covariates), drop = FALSE])
+  df <- df[keep, , drop = FALSE]
+
+  y <- df[[trait]]
+  X_marker <- prep_marker_matrix(df, marker_names)
+
+  X_cov <- model.matrix(
+    reformulate(covariates),
+    data = df
+  )[, -1, drop = FALSE]
+
+  x_all <- cbind(X_cov, X_marker)
+  cov_names <- colnames(X_cov)
+
+  penalty_factor <- c(rep(0, ncol(X_cov)), rep(1, ncol(X_marker)))
+
+  set.seed(seed)
+  cvfit <- glmnet::cv.glmnet(
+    x = x_all,
+    y = y,
+    family = "gaussian",
+    alpha = alpha,
+    nfolds = nfolds,
+    standardize = TRUE,
+    intercept = TRUE,
+    penalty.factor = penalty_factor
+  )
+
+  coef_min <- coef(cvfit, s = "lambda.min")
+  coef_1se <- coef(cvfit, s = "lambda.1se")
+
+  nz_min <- rownames(coef_min)[as.vector(coef_min != 0)]
+  nz_1se <- rownames(coef_1se)[as.vector(coef_1se != 0)]
+
+  nz_min <- setdiff(nz_min, "(Intercept)")
+  nz_1se <- setdiff(nz_1se, "(Intercept)")
+
+  covariates_nonzero_min <- intersect(nz_min, cov_names)
+  covariates_nonzero_1se <- intersect(nz_1se, cov_names)
+
+  selected_markers_min <- setdiff(nz_min, cov_names)
+  selected_markers_1se <- setdiff(nz_1se, cov_names)
+
+  tibble(
+    trait = trait,
+    lambda_min = cvfit$lambda.min,
+    lambda_1se = cvfit$lambda.1se,
+    n_covariates_nonzero_min = length(covariates_nonzero_min),
+    n_covariates_nonzero_1se = length(covariates_nonzero_1se),
+    n_selected_markers_min = length(selected_markers_min),
+    n_selected_markers_1se = length(selected_markers_1se),
+    covariates_nonzero_min = list(covariates_nonzero_min),
+    covariates_nonzero_1se = list(covariates_nonzero_1se),
+    selected_markers_min = list(selected_markers_min),
+    selected_markers_1se = list(selected_markers_1se),
+    cvfit = list(cvfit)
+  )
+}
+
+get_lasso_selected_markers <- function(lasso_tbl, trait_name, rule = c("1se", "min")) {
+  rule <- match.arg(rule)
+  if (rule == "1se") {
+    out <- lasso_tbl %>% filter(trait == trait_name) %>% pull(selected_markers_1se)
+  } else {
+    out <- lasso_tbl %>% filter(trait == trait_name) %>% pull(selected_markers_min)
+  }
+
+  if (length(out) == 0) return(character(0))
+  unique(out[[1]])
+}
+
+jaccard_index <- function(a, b) {
+  a <- unique(a)
+  b <- unique(b)
+  if (length(union(a, b)) == 0) return(NA_real_)
+  length(intersect(a, b)) / length(union(a, b))
+}
+
+calc_selection_metrics <- function(selected, truth) {
+  selected <- unique(selected)
+  truth <- unique(truth)
+
+  tp <- sum(selected %in% truth)
+  fp <- sum(!(selected %in% truth))
+  fn <- sum(!(truth %in% selected))
+
+  tibble(
+    n_selected = length(selected),
+    n_true = length(truth),
+    tp = tp,
+    fp = fp,
+    fn = fn,
+    exact_power = tp / length(truth),
+    recall = tp / length(truth),
+    precision = ifelse(length(selected) == 0, NA_real_, tp / length(selected)),
+    fdr = ifelse(length(selected) == 0, 0, fp / length(selected))
+  )
+}
+```
+
+```{r fit-three-core-models}
+# Baseline single-marker model
+covars_season_only <- c("Season")
+scan_season_only <- lapply(trait_names, function(tr) {
+  fast_single_marker_scan_cov(
+    df = analysis_df,
+    trait = tr,
+    marker_names = marker_names,
+    covariates = covars_season_only
+  )
+}) %>%
+  bind_rows() %>%
+  left_join(map_df, by = "SNP_ID") %>%
+  mutate(log10p = -log10(p.value))
+scan_season_only_adj <- add_multiple_testing(scan_season_only)
+
+# PCA-adjusted single-marker model
+covars_season_pc <- c("Season", "PC1", "PC2", "PC3", "PC4", "PC5")
+scan_season_pc <- lapply(trait_names, function(tr) {
+  fast_single_marker_scan_cov(
+    df = analysis_df,
+    trait = tr,
+    marker_names = marker_names,
+    covariates = covars_season_pc
+  )
+}) %>%
+  bind_rows() %>%
+  left_join(map_df, by = "SNP_ID") %>%
+  mutate(log10p = -log10(p.value))
+scan_season_pc_adj <- add_multiple_testing(scan_season_pc)
+
+# Lasso multi-marker model: season + PCs
+lasso_results_checked <- lapply(trait_names, function(tr) {
+  run_lasso_trait_checked(
+    df = analysis_df,
+    trait = tr,
+    marker_names = marker_names,
+    covariates = c("Season", "PC1", "PC2", "PC3", "PC4", "PC5"),
+    alpha = 1,
+    nfolds = 10,
+    seed = 123
+  )
+}) %>%
+  bind_rows()
+
+# Lasso sensitivity model: season only
+lasso_results_final <- lapply(trait_names, function(tr) {
+  run_lasso_trait_checked(
+    df = analysis_df,
+    trait = tr,
+    marker_names = marker_names,
+    covariates = c("Season"),
+    alpha = 1,
+    nfolds = 10,
+    seed = 123
+  )
+}) %>%
+  bind_rows()
+
+# Long-format lasso outputs reused later and in appendix
+lasso_selected_min <- lasso_results_checked %>%
+  select(trait, selected_markers_min) %>%
+  tidyr::unnest_longer(selected_markers_min, values_to = "SNP_ID") %>%
+  filter(!is.na(SNP_ID))
+
+lasso_selected_1se <- lasso_results_checked %>%
+  select(trait, selected_markers_1se) %>%
+  tidyr::unnest_longer(selected_markers_1se, values_to = "SNP_ID") %>%
+  filter(!is.na(SNP_ID))
+
+lasso_final_selected_min <- lasso_results_final %>%
+  select(trait, selected_markers_min) %>%
+  tidyr::unnest_longer(selected_markers_min, values_to = "SNP_ID") %>%
+  filter(!is.na(SNP_ID))
+
+lasso_final_selected_1se <- lasso_results_final %>%
+  select(trait, selected_markers_1se) %>%
+  tidyr::unnest_longer(selected_markers_1se, values_to = "SNP_ID") %>%
+  filter(!is.na(SNP_ID))
+```
+
+The first model in the analysis is a baseline single-marker regression with season adjustment. This model follows the classical logic of regression-based QTL mapping, where each marker is tested one at a time. The model is written as
+
+$$y_{is} = \alpha + \beta_j G_{ij} + \gamma_s \mathrm{Season}_s + \varepsilon_{is}$$​,
+
+where $y_{is}$​ is the phenotype of line$i$ observed in season $s$, $G_{ij}$is the genotype score of marker $j$ for line $i$, $\alpha$ is the intercept, $\beta_j$is the marker-specific regression coefficient, $\gamma_s$ represents the seasonal effect, and $\varepsilon_{is}$ is the residual error term. In this framework, the main quantity of interest is $\beta_j$, because it measures whether marker $j$ is associated with the phenotype after controlling for broad seasonal differences.
+
+This baseline model is important for two reasons. First, it is directly connected to the classical QTL literature, where marker-trait association is evaluated through regression of phenotype on genotype. Second, it provides a transparent benchmark for later comparison with more complex models. Because the descriptive analysis in Section 2 already showed strong seasonal shifts in several traits, the inclusion of $\mathrm{Season}_s$is necessary rather than optional. Without seasonal adjustment, the marker coefficient $\beta_j$​ could partly capture environmental or temporal variation instead of genetic association.
+
+## 3.2. Comparing model performance
+
+```{r compare-season-and-pca-scans}
+sig_summary <- bind_rows(
+  scan_season_only_adj %>% mutate(model = "Season only"),
+  scan_season_pc_adj %>% mutate(model = "Season + PC1-5")
+) %>%
+  group_by(model, trait) %>%
+  summarise(
+    n_raw  = sum(sig_raw, na.rm = TRUE),
+    n_bh   = sum(sig_bh, na.rm = TRUE),
+    n_bonf = sum(sig_bonf, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+knitr::kable(
+  sig_summary,
+  digits = 3,
+  caption = "Number of significant markers under alternative covariate specifications."
+)
+
+trait_to_plot <- "Lint_percentage"
+
+top_markers_compare <- scan_season_only_adj %>%
+  filter(trait == trait_to_plot) %>%
+  arrange(p.value) %>%
+  slice_head(n = 20) %>%
+  select(
+    SNP_ID,
+    estimate_season = estimate,
+    p_season = p.value,
+    log10p_season = log10p,
+    sig_bh_season = sig_bh,
+    sig_bonf_season = sig_bonf
+  ) %>%
+  left_join(
+    scan_season_pc_adj %>%
+      filter(trait == trait_to_plot) %>%
+      select(
+        SNP_ID,
+        estimate_pc = estimate,
+        p_pc = p.value,
+        log10p_pc = log10p,
+        sig_bh_pc = sig_bh,
+        sig_bonf_pc = sig_bonf
+      ),
+    by = "SNP_ID"
+  ) %>%
+  mutate(
+    abs_est_change = abs(estimate_pc - estimate_season),
+    p_ratio = p_pc / p_season
+  )
+
+knitr::kable(
+  top_markers_compare,
+  digits = 4,
+  caption = "Comparison of the top 20 markers for lint percentage under season-only and PC-adjusted single-marker models."
+)
+
+bh_season <- select_marker_set(scan_season_only_adj, trait_to_plot, rule = "bh")
+bh_pc     <- select_marker_set(scan_season_pc_adj, trait_to_plot, rule = "bh")
+
+overlap_summary_bh <- tibble(
+  trait = trait_to_plot,
+  rule = "BH-FDR",
+  n_season = length(bh_season),
+  n_pc = length(bh_pc),
+  n_overlap = length(intersect(bh_season, bh_pc)),
+  jaccard = jaccard_index(bh_season, bh_pc)
+)
+
+knitr::kable(
+  overlap_summary_bh,
+  digits = 3,
+  caption = "Overlap in BH-significant markers between the season-only and PC-adjusted scans."
+)
+```
+
+$$ J(A, B) = \frac{|A \cap B|}{|A \cup B|} $$
+
+```{r scan-comparison-plots-and-summary}
+sig_summary_long <- sig_summary %>%
+  pivot_longer(
+    cols = c(n_raw, n_bh, n_bonf),
+    names_to = "threshold",
+    values_to = "n_significant"
+  )
+
+ggplot(sig_summary_long, aes(x = threshold, y = n_significant, fill = model)) +
+  geom_col(position = "dodge") +
+  facet_wrap(~ trait, scales = "free_y") +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Number of significant markers across model specifications",
+    x = NULL,
+    y = "Number of significant markers"
+  )
+
+compare_scan_df <- scan_season_only_adj %>%
+  select(
+    trait, SNP_ID,
+    p_season = p.value,
+    log10p_season = log10p,
+    estimate_season = estimate,
+    p_adj_bh_season = p_adj_bh,
+    p_adj_bonf_season = p_adj_bonf
+  ) %>%
+  left_join(
+    scan_season_pc_adj %>%
+      select(
+        trait, SNP_ID,
+        p_pc = p.value,
+        log10p_pc = log10p,
+        estimate_pc = estimate,
+        p_adj_bh_pc = p_adj_bh,
+        p_adj_bonf_pc = p_adj_bonf
+      ),
+    by = c("trait", "SNP_ID")
+  )
+
+ggplot(
+  compare_scan_df %>% filter(trait == trait_to_plot),
+  aes(x = log10p_season, y = log10p_pc)
+) +
+  geom_point(alpha = 0.35, size = 0.8) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = paste("Season only vs Season + PC1-5:", trait_to_plot),
+    x = expression(-log[10](p)~"(Season only)"),
+    y = expression(-log[10](p)~"(Season + PC1-5)")
+  )
+
+ggplot(
+  compare_scan_df %>% filter(trait == trait_to_plot),
+  aes(x = estimate_season, y = estimate_pc)
+) +
+  geom_point(alpha = 0.35, size = 0.8) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = paste("Marker effect estimates:", trait_to_plot),
+    x = "Estimate (Season only)",
+    y = "Estimate (Season + PC1-5)"
+  )
+
+scan_diff_summary <- compare_scan_df %>%
+  group_by(trait) %>%
+  summarise(
+    cor_log10p = cor(log10p_season, log10p_pc, use = "complete.obs"),
+    cor_estimate = cor(estimate_season, estimate_pc, use = "complete.obs"),
+    mean_abs_est_diff = mean(abs(estimate_pc - estimate_season), na.rm = TRUE),
+    n_bh_season = sum(p_adj_bh_season < 0.05, na.rm = TRUE),
+    n_bh_pc = sum(p_adj_bh_pc < 0.05, na.rm = TRUE),
+    n_bonf_season = sum(p_adj_bonf_season < 0.05, na.rm = TRUE),
+    n_bonf_pc = sum(p_adj_bonf_pc < 0.05, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+knitr::kable(
+  scan_diff_summary,
+  digits = 3,
+  caption = "Summary comparison of marker-level evidence between season-only and PC-adjusted scans."
+)
+```
+
+```{r exact-lm-validation}
+make_season_residuals <- function(df, trait_names) {
+  df <- as.data.frame(df)
+
+  for (tr in trait_names) {
+    tmp <- data.frame(
+      .y = df[[tr]],
+      .season = df[["Season"]]
+    )
+
+    keep <- complete.cases(tmp)
+    resid_vec <- rep(NA_real_, nrow(df))
+
+    fit <- lm(.y ~ .season, data = tmp[keep, , drop = FALSE])
+    resid_vec[keep] <- resid(fit)
+
+    df[[paste0(tr, "_season_resid")]] <- resid_vec
+  }
+
+  df
+}
+
+run_exact_resid_lm <- function(df, resid_trait, marker_names) {
+  df <- as.data.frame(df)
+
+  out <- lapply(marker_names, function(mk) {
+    tmp <- data.frame(
+      .y = df[[resid_trait]],
+      .marker = df[[mk]]
+    )
+
+    tmp <- tmp[complete.cases(tmp), , drop = FALSE]
+
+    if (nrow(tmp) < 3 || var(tmp$.marker) == 0) {
+      return(tibble(
+        resid_trait = resid_trait,
+        SNP_ID = mk,
+        estimate = NA_real_,
+        std.error = NA_real_,
+        statistic = NA_real_,
+        p.value = NA_real_
+      ))
+    }
+
+    fit <- lm(.y ~ .marker, data = tmp)
+    co <- broom::tidy(fit)
+    co <- co[co$term == ".marker", , drop = FALSE]
+
+    tibble(
+      resid_trait = resid_trait,
+      SNP_ID = mk,
+      estimate = co$estimate,
+      std.error = co$std.error,
+      statistic = co$statistic,
+      p.value = co$p.value
+    )
+  })
+
+  bind_rows(out)
+}
+
+analysis_df_resid <- make_season_residuals(analysis_df, trait_names)
+trait_to_check <- "Lint_percentage"
+
+top20_markers <- scan_season_only_adj %>%
+  filter(trait == trait_to_check) %>%
+  arrange(p.value) %>%
+  slice_head(n = 20) %>%
+  pull(SNP_ID)
+
+exact_resid_lm_results <- run_exact_resid_lm(
+  df = analysis_df_resid,
+  resid_trait = paste0(trait_to_check, "_season_resid"),
+  marker_names = top20_markers
+)
+
+compare_resid_vs_scan <- scan_season_only_adj %>%
+  filter(trait == trait_to_check, SNP_ID %in% top20_markers) %>%
+  select(
+    SNP_ID,
+    estimate_scan = estimate,
+    p_scan = p.value,
+    log10p_scan = log10p
+  ) %>%
+  left_join(
+    exact_resid_lm_results %>%
+      select(
+        SNP_ID,
+        estimate_resid_lm = estimate,
+        p_resid_lm = p.value
+      ),
+    by = "SNP_ID"
+  )
+
+knitr::kable(
+  compare_resid_vs_scan,
+  digits = 4,
+  caption = "Comparison between the fast scan statistics and exact linear-model estimates using season-residualised lint percentage."
+)
+```
+
+```{r compare-three-core-models}
+# Lasso summaries retained for reporting
+lasso_summary_checked <- lasso_results_checked %>%
+  select(
+    trait,
+    lambda_min, lambda_1se,
+    n_covariates_nonzero_min, n_covariates_nonzero_1se,
+    n_selected_markers_min, n_selected_markers_1se
+  )
+
+knitr::kable(
+  lasso_summary_checked,
+  digits = 3,
+  caption = "Lasso selection summary under season and PC adjustment."
+)
+
+lasso_cov_diag <- lasso_results_checked %>%
+  select(trait, covariates_nonzero_min, covariates_nonzero_1se) %>%
+  mutate(
+    covariates_nonzero_min = purrr::map_chr(covariates_nonzero_min, ~ paste(.x, collapse = ", ")),
+    covariates_nonzero_1se = purrr::map_chr(covariates_nonzero_1se, ~ paste(.x, collapse = ", "))
+  )
+
+knitr::kable(
+  lasso_cov_diag,
+  caption = "Non-zero covariates retained by lasso under the lambda.min and lambda.1se rules."
+)
+
+lasso_summary_final <- lasso_results_final %>%
+  select(
+    trait,
+    lambda_min, lambda_1se,
+    n_covariates_nonzero_min, n_covariates_nonzero_1se,
+    n_selected_markers_min, n_selected_markers_1se
+  )
+
+knitr::kable(
+  lasso_summary_final,
+  digits = 3,
+  caption = "Lasso selection summary under season-only adjustment."
+)
+
+three_model_size_summary <- purrr::map_dfr(trait_names, function(tr) {
+  tibble(
+    trait = tr,
+    n_season_bh = length(select_marker_set(scan_season_only_adj, tr, rule = "bh")),
+    n_pca_bh = length(select_marker_set(scan_season_pc_adj, tr, rule = "bh")),
+    n_lasso_pc_min = length(get_lasso_selected_markers(lasso_results_checked, tr, rule = "min")),
+    n_lasso_pc_1se = length(get_lasso_selected_markers(lasso_results_checked, tr, rule = "1se"))
+  )
+})
+
+knitr::kable(
+  three_model_size_summary,
+  digits = 3,
+  caption = "Comparison of selected marker counts across the three core models."
+)
+
+three_model_overlap_summary <- purrr::map_dfr(trait_names, function(tr) {
+  season_set <- select_marker_set(scan_season_only_adj, tr, rule = "bh")
+  pca_set <- select_marker_set(scan_season_pc_adj, tr, rule = "bh")
+  lasso_set <- get_lasso_selected_markers(lasso_results_checked, tr, rule = "1se")
+
+  tibble(
+    trait = tr,
+    overlap_season_pca = length(intersect(season_set, pca_set)),
+    overlap_season_lasso = length(intersect(season_set, lasso_set)),
+    overlap_pca_lasso = length(intersect(pca_set, lasso_set)),
+    jaccard_season_pca = jaccard_index(season_set, pca_set),
+    jaccard_season_lasso = jaccard_index(season_set, lasso_set),
+    jaccard_pca_lasso = jaccard_index(pca_set, lasso_set)
+  )
+})
+
+knitr::kable(
+  three_model_overlap_summary,
+  digits = 3,
+  caption = "Pairwise overlap and Jaccard similarity across the three core models."
+)
+
+three_model_counts_long <- three_model_size_summary %>%
+  pivot_longer(
+    cols = c(n_season_bh, n_pca_bh, n_lasso_pc_1se),
+    names_to = "model",
+    values_to = "n_selected"
+  ) %>%
+  mutate(
+    model = recode(
+      model,
+      n_season_bh = "Season-only scan (BH)",
+      n_pca_bh = "PCA-adjusted scan (BH)",
+      n_lasso_pc_1se = "Lasso + PC (lambda.1se)"
+    )
+  )
+
+ggplot(three_model_counts_long, aes(x = model, y = n_selected, fill = model)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ trait, scales = "free_y") +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Selected marker counts across the three core models",
+    x = NULL,
+    y = "Number of selected markers"
+  ) +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+```
+
+## 3.3. Power analysis
+
+```{r power-analysis-helper-functions}
+simulate_trait_from_real_genotypes <- function(df, causal_markers,
+                                               genetic_r2 = 0.30,
+                                               season_r2 = 0.20,
+                                               seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  stopifnot(genetic_r2 > 0, season_r2 >= 0, genetic_r2 + season_r2 < 1)
+
+  X_causal <- prep_marker_matrix(df, causal_markers)
+  X_causal <- scale(X_causal)
+
+  beta_raw <- rnorm(length(causal_markers))
+  beta_raw <- beta_raw / sqrt(sum(beta_raw^2))
+
+  genetic_component <- as.vector(X_causal %*% beta_raw)
+  genetic_component <- as.numeric(scale(genetic_component))
+
+  season_template <- c("Season_1" = -1, "Season_2" = 0, "Season_3" = 1)
+  season_component <- unname(season_template[as.character(df$Season)])
+  season_component <- as.numeric(scale(season_component))
+
+  error_component <- as.numeric(scale(rnorm(nrow(df))))
+
+  sim_trait <- sqrt(genetic_r2) * genetic_component +
+    sqrt(season_r2) * season_component +
+    sqrt(1 - genetic_r2 - season_r2) * error_component
+
+  tibble(
+    sim_trait = sim_trait,
+    genetic_component = genetic_component,
+    season_component = season_component,
+    error_component = error_component
+  )
+}
+
+fit_three_models_on_simulated_trait <- function(df_sim,
+                                                marker_names,
+                                                lasso_nfolds = 5,
+                                                seed = 123) {
+  season_scan <- fast_single_marker_scan_cov(
+    df = df_sim,
+    trait = "sim_trait",
+    marker_names = marker_names,
+    covariates = c("Season")
+  ) %>%
+    mutate(log10p = -log10(p.value)) %>%
+    add_multiple_testing()
+
+  pca_scan <- fast_single_marker_scan_cov(
+    df = df_sim,
+    trait = "sim_trait",
+    marker_names = marker_names,
+    covariates = c("Season", "PC1", "PC2", "PC3", "PC4", "PC5")
+  ) %>%
+    mutate(log10p = -log10(p.value)) %>%
+    add_multiple_testing()
+
+  lasso_fit <- run_lasso_trait_checked(
+    df = df_sim,
+    trait = "sim_trait",
+    marker_names = marker_names,
+    covariates = c("Season", "PC1", "PC2", "PC3", "PC4", "PC5"),
+    alpha = 1,
+    nfolds = lasso_nfolds,
+    seed = seed
+  )
+
+  list(
+    season_scan = season_scan,
+    pca_scan = pca_scan,
+    lasso_fit = lasso_fit
+  )
+}
+
+run_power_scenario <- function(df,
+                               marker_names,
+                               scenario_name,
+                               n_causal,
+                               genetic_r2,
+                               season_r2,
+                               nsim = 5,
+                               lasso_nfolds = 5,
+                               seed = 1234) {
+  out <- vector("list", nsim)
+
+  for (b in seq_len(nsim)) {
+    set.seed(seed + b)
+    causal_markers <- sample(marker_names, size = n_causal, replace = FALSE)
+
+    sim_obj <- simulate_trait_from_real_genotypes(
+      df = df,
+      causal_markers = causal_markers,
+      genetic_r2 = genetic_r2,
+      season_r2 = season_r2,
+      seed = seed + 1000 + b
+    )
+
+    df_sim <- df %>% mutate(sim_trait = sim_obj$sim_trait)
+    fit_obj <- fit_three_models_on_simulated_trait(
+      df_sim = df_sim,
+      marker_names = marker_names,
+      lasso_nfolds = lasso_nfolds,
+      seed = seed + 2000 + b
+    )
+
+    selected_sets <- list(
+      `Season-only scan (BH)` = select_marker_set(fit_obj$season_scan, "sim_trait", rule = "bh"),
+      `PCA-adjusted scan (BH)` = select_marker_set(fit_obj$pca_scan, "sim_trait", rule = "bh"),
+      `Lasso + PC (lambda.1se)` = get_lasso_selected_markers(fit_obj$lasso_fit, "sim_trait", rule = "1se")
+    )
+
+    out[[b]] <- bind_rows(lapply(names(selected_sets), function(method_name) {
+      calc_selection_metrics(selected_sets[[method_name]], causal_markers) %>%
+        mutate(
+          scenario = scenario_name,
+          sim = b,
+          method = method_name,
+          n_causal = n_causal,
+          genetic_r2 = genetic_r2,
+          season_r2 = season_r2
+        )
+    }))
+  }
+
+  bind_rows(out)
+}
+```
+
+```{r run-power-analysis}
+# Keep defaults modest for runtime. Increase nsim later if needed.
+power_scenarios <- tibble(
+  scenario = c("Sparse_strong", "Moderate_moderate", "Polygenic_weaker"),
+  n_causal = c(5, 10, 25),
+  genetic_r2 = c(0.35, 0.25, 0.20),
+  season_r2 = c(0.20, 0.20, 0.20)
+)
+
+nsim_power <- 5
+
+power_results <- purrr::pmap_dfr(
+  power_scenarios,
+  function(scenario, n_causal, genetic_r2, season_r2) {
+    run_power_scenario(
+      df = analysis_df,
+      marker_names = marker_names,
+      scenario_name = scenario,
+      n_causal = n_causal,
+      genetic_r2 = genetic_r2,
+      season_r2 = season_r2,
+      nsim = nsim_power,
+      lasso_nfolds = 5,
+      seed = 2026
+    )
+  }
+)
+
+power_summary <- power_results %>%
+  group_by(scenario, method, n_causal, genetic_r2, season_r2) %>%
+  summarise(
+    power_mean = mean(exact_power, na.rm = TRUE),
+    power_sd = sd(exact_power, na.rm = TRUE),
+    precision_mean = mean(precision, na.rm = TRUE),
+    precision_sd = sd(precision, na.rm = TRUE),
+    fdr_mean = mean(fdr, na.rm = TRUE),
+    fdr_sd = sd(fdr, na.rm = TRUE),
+    n_selected_mean = mean(n_selected, na.rm = TRUE),
+    n_selected_sd = sd(n_selected, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+knitr::kable(
+  power_summary,
+  digits = 3,
+  caption = "Power-analysis summary across simulation scenarios and models."
+)
+```
+
+```{r power-analysis-plots}
+ggplot(power_summary, aes(x = method, y = power_mean, fill = method)) +
+  geom_col(show.legend = FALSE) +
+  geom_errorbar(aes(ymin = power_mean - power_sd, ymax = power_mean + power_sd), width = 0.2) +
+  facet_wrap(~ scenario) +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Simulation-based power comparison across the three core models",
+    x = NULL,
+    y = "Mean exact power"
+  ) +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+
+ggplot(power_summary, aes(x = method, y = fdr_mean, fill = method)) +
+  geom_col(show.legend = FALSE) +
+  geom_errorbar(aes(ymin = pmax(fdr_mean - fdr_sd, 0), ymax = pmin(fdr_mean + fdr_sd, 1)), width = 0.2) +
+  facet_wrap(~ scenario) +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Simulation-based false discovery comparison across the three core models",
+    x = NULL,
+    y = "Mean false discovery rate"
+  ) +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+
+ggplot(power_summary, aes(x = method, y = n_selected_mean, fill = method)) +
+  geom_col(show.legend = FALSE) +
+  geom_errorbar(aes(ymin = pmax(n_selected_mean - n_selected_sd, 0), ymax = n_selected_mean + n_selected_sd), width = 0.2) +
+  facet_wrap(~ scenario, scales = "free_y") +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Average number of selected markers in the power analysis",
+    x = NULL,
+    y = "Mean number of selected markers"
+  ) +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+```
+
+# 4. Conclusion
+
+This week-5 workflow moves the analysis beyond a simple one-marker-at-a-time QTL scan and toward a more structured comparison between classical and shrinkage-based approaches. The report first reconstructs the empirical structure of the cotton MAGIC data, then evaluates low-dimensional genotype structure using PCA, and finally compares season-only, PC-adjusted, and lasso-based specifications. Taken together, these steps provide a clearer basis for assessing whether apparent marker associations are robust to broader genomic structure and whether multi-marker shrinkage yields a more parsimonious representation of the signal.
+
+More substantive interpretation of the estimated markers, effect sizes, and trait-specific selection patterns can be added after reviewing the outputs generated in Section 3 and the appendix.
+
+# Appendix
+
+## A.1. Selected markers from lasso
+
+```{r}
+lasso_selected_min <- lasso_results_checked %>%
+  select(trait, selected_markers_min) %>%
+  tidyr::unnest_longer(selected_markers_min, values_to = "SNP_ID") %>%
+  filter(!is.na(SNP_ID))
+
+lasso_selected_1se <- lasso_results_checked %>%
+  select(trait, selected_markers_1se) %>%
+  tidyr::unnest_longer(selected_markers_1se, values_to = "SNP_ID") %>%
+  filter(!is.na(SNP_ID))
+
+knitr::kable(
+  lasso_selected_min,
+  caption = "Markers selected by lasso under lambda.min with season and PC adjustment."
+)
+
+knitr::kable(
+  lasso_selected_1se,
+  caption = "Markers selected by lasso under lambda.1se with season and PC adjustment."
+)
+```
+
+## A.2. Selected markers from season-only lasso
+
+```{r}
+lasso_final_selected_min <- lasso_results_final %>%
+  select(trait, selected_markers_min) %>%
+  tidyr::unnest_longer(selected_markers_min, values_to = "SNP_ID") %>%
+  filter(!is.na(SNP_ID))
+
+lasso_final_selected_1se <- lasso_results_final %>%
+  select(trait, selected_markers_1se) %>%
+  tidyr::unnest_longer(selected_markers_1se, values_to = "SNP_ID") %>%
+  filter(!is.na(SNP_ID))
+
+knitr::kable(
+  lasso_final_selected_min,
+  caption = "Markers selected by season-only lasso under lambda.min."
+)
+
+knitr::kable(
+  lasso_final_selected_1se,
+  caption = "Markers selected by season-only lasso under lambda.1se."
+)
+```
+
+## A.3. Exact residualized linear-model estimates
+
+```{r}
+knitr::kable(
+  exact_resid_lm_results,
+  digits = 4,
+  caption = "Exact linear-model estimates for the top 20 lint percentage markers using season-residualised phenotypes."
+)
+```
+
+zhen
