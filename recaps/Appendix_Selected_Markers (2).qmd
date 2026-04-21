@@ -1,0 +1,733 @@
+---
+title: "Supplementary Appendix: Complete Lists of Selected Markers"
+subtitle: "QTL Mapping of Cotton Fibre Quality Traits"
+author: "Shiyan Miao"
+date: today
+format:
+  pdf:
+    documentclass: article
+    toc: true
+    lot: true
+    colorlinks: true
+    number-sections: true
+    number-depth: 2
+    keep-tex: false
+    geometry:
+      - margin=1in
+    fontsize: 10pt
+execute:
+  echo: false
+  warning: false
+  message: false
+editor: visual
+---
+
+```{r setup}
+library(tidyverse)
+library(data.table)
+library(glmnet)
+library(knitr)
+library(kableExtra)
+library(scales)
+library(irlba)
+
+set.seed(2026)
+
+knitr::opts_chunk$set(fig.align = "center")
+
+geno_file  <- "Genotype_data.txt"
+map_file   <- "Genetic_map.txt"
+pheno_file <- "Phenotype_data.txt"
+```
+
+```{r load-and-process}
+# ── Import ────────────────────────────────────────────────────────────────────
+geno_raw  <- fread(geno_file, header = FALSE)
+map_df    <- fread(map_file)
+# Standardise all three column names positionally.
+# map_df always has exactly 3 columns: marker ID, chromosome, position.
+# This avoids any conflict with ggplot2::Position in tidyselect contexts.
+names(map_df) <- c("SNP_ID", "Chromosome", "Pos_cM")
+pheno_raw <- fread(pheno_file)
+
+geno_df           <- as.data.frame(geno_raw)
+colnames(geno_df) <- map_df$SNP_ID
+geno_df$Line      <- seq_len(nrow(geno_df))
+
+n_lines <- nrow(geno_df)
+n_pheno <- nrow(pheno_raw)
+
+pheno_df <- pheno_raw %>%
+  mutate(
+    RowID  = row_number(),
+    Season = case_when(
+      RowID <= n_lines       ~ "Season_1",
+      RowID <= 2 * n_lines   ~ "Season_2",
+      TRUE                   ~ "Season_3"
+    ),
+    Line = rep(seq_len(n_lines), times = n_pheno / n_lines)
+  ) %>%
+  relocate(Line, Season, RowID)
+
+analysis_df <- pheno_df %>% left_join(geno_df, by = "Line")
+
+trait_names <- c("Lint_percentage", "Seed_index",
+                 "Lint_index",      "Seed_oil_content")
+
+trait_labels <- c(
+  Lint_percentage  = "Lint Percentage",
+  Seed_index       = "Seed Index",
+  Lint_index       = "Lint Index",
+  Seed_oil_content = "Seed Oil Content"
+)
+```
+
+```{r prepare-genotype}
+# ── Genotype matrix: impute, filter, PCA ──────────────────────────────────────
+X_geno       <- geno_df %>% select(-Line) %>% as.matrix()
+mode(X_geno)  <- "numeric"
+
+for (j in seq_len(ncol(X_geno))) {
+  miss <- is.na(X_geno[, j])
+  if (any(miss)) X_geno[miss, j] <- mean(X_geno[, j], na.rm = TRUE)
+}
+
+marker_keep  <- apply(X_geno, 2, function(x) var(x, na.rm = TRUE) > 0)
+X_geno       <- X_geno[, marker_keep, drop = FALSE]
+marker_names <- colnames(X_geno)
+
+set.seed(123)
+pca_fit <- prcomp_irlba(
+  x = scale(X_geno, center = TRUE, scale = TRUE),
+  n = 20, center = FALSE, scale. = FALSE
+)
+
+pc_line_df  <- as_tibble(pca_fit$x[, 1:5]) %>%
+  setNames(paste0("PC", 1:5)) %>%
+  mutate(Line = seq_len(n()))
+
+analysis_df <- analysis_df %>%
+  select(-any_of(paste0("PC", 1:5))) %>%
+  left_join(pc_line_df, by = "Line") %>%
+  mutate(Season = factor(Season))
+```
+
+```{r helper-functions}
+prep_marker_matrix <- function(df, marker_names) {
+  df <- as.data.frame(df)
+  X  <- as.matrix(df[, marker_names, drop = FALSE])
+  mode(X) <- "numeric"
+  if (anyNA(X)) {
+    col_means <- colMeans(X, na.rm = TRUE)
+    idx       <- which(is.na(X), arr.ind = TRUE)
+    X[idx]    <- col_means[idx[, 2]]
+  }
+  X
+}
+
+fast_single_marker_scan_cov <- function(df, trait, marker_names,
+                                        covariates = "Season") {
+  df          <- as.data.frame(df)
+  needed_cols <- unique(c(trait, covariates, marker_names))
+  df          <- df[, needed_cols, drop = FALSE]
+  keep        <- complete.cases(df[, c(trait, covariates), drop = FALSE])
+  df          <- df[keep, , drop = FALSE]
+
+  y   <- df[[trait]]
+  X   <- prep_marker_matrix(df, marker_names)
+  C   <- model.matrix(
+    as.formula(paste("~", paste(covariates, collapse = " + "))), data = df)
+  qrC <- qr(C)
+
+  y_res <- qr.resid(qrC, y)
+  X_res <- qr.resid(qrC, X)
+  Sxx   <- colSums(X_res^2)
+  Sxy   <- as.vector(crossprod(X_res, y_res))
+  Syy   <- sum(y_res^2)
+  df_r  <- nrow(df) - qrC$rank - 1L
+  valid <- Sxx > 1e-12
+
+  beta <- rss <- se <- tval <- pval <- rep(NA_real_, length(marker_names))
+  beta[valid]  <- Sxy[valid] / Sxx[valid]
+  rss[valid]   <- pmax(Syy - Sxy[valid]^2 / Sxx[valid], 0)
+  se[valid]    <- sqrt((rss[valid] / df_r) / Sxx[valid])
+  tval[valid]  <- beta[valid] / se[valid]
+  pval[valid]  <- 2 * pt(abs(tval[valid]), df = df_r, lower.tail = FALSE)
+
+  tibble(trait = trait, SNP_ID = marker_names,
+         estimate = beta, std.error = se,
+         statistic = tval, p.value = pval)
+}
+
+add_multiple_testing <- function(scan_df, alpha = 0.05) {
+  scan_df %>%
+    group_by(trait) %>%
+    arrange(p.value, .by_group = TRUE) %>%
+    mutate(
+      p_adj_bh   = p.adjust(p.value, method = "BH"),
+      p_adj_bonf = p.adjust(p.value, method = "bonferroni"),
+      sig_bh     = p_adj_bh   < alpha,
+      sig_bonf   = p_adj_bonf < alpha
+    ) %>%
+    ungroup()
+}
+
+run_lasso_trait <- function(df, trait, marker_names,
+                            covariates = c("Season","PC1","PC2","PC3","PC4","PC5"),
+                            alpha = 1, nfolds = 10, seed = 123) {
+  df   <- as.data.frame(df)
+  keep <- complete.cases(df[, c(trait, covariates), drop = FALSE])
+  df   <- df[keep, , drop = FALSE]
+
+  y        <- df[[trait]]
+  X_marker <- prep_marker_matrix(df, marker_names)
+  X_cov    <- model.matrix(reformulate(covariates), data = df)[, -1, drop = FALSE]
+  x_all    <- cbind(X_cov, X_marker)
+  cov_names      <- colnames(X_cov)
+  penalty_factor <- c(rep(0, ncol(X_cov)), rep(1, ncol(X_marker)))
+
+  set.seed(seed)
+  cvfit <- cv.glmnet(x_all, y, family = "gaussian", alpha = alpha,
+                     nfolds = nfolds, standardize = TRUE,
+                     intercept = TRUE, penalty.factor = penalty_factor)
+
+  extract_markers <- function(s) {
+    co  <- coef(cvfit, s = s)
+    nz  <- setdiff(rownames(co)[as.vector(co != 0)], c("(Intercept)", cov_names))
+    ef  <- as.vector(co[nz, ])
+    tibble(SNP_ID = nz, coefficient = ef)
+  }
+
+  list(
+    min = extract_markers("lambda.min"),
+    `1se` = extract_markers("lambda.1se"),
+    lambda_min = cvfit$lambda.min,
+    lambda_1se = cvfit$lambda.1se
+  )
+}
+```
+
+```{r run-all-models}
+# ── Single-marker scans ───────────────────────────────────────────────────────
+scan_season <- lapply(trait_names, function(tr)
+  fast_single_marker_scan_cov(analysis_df, tr, marker_names,
+                              covariates = "Season")) %>%
+  bind_rows() %>%
+  left_join(map_df, by = "SNP_ID") %>%
+  mutate(log10p = -log10(p.value)) %>%
+  add_multiple_testing()
+
+scan_pc <- lapply(trait_names, function(tr)
+  fast_single_marker_scan_cov(analysis_df, tr, marker_names,
+                              covariates = c("Season","PC1","PC2","PC3","PC4","PC5"))) %>%
+  bind_rows() %>%
+  left_join(map_df, by = "SNP_ID") %>%
+  mutate(log10p = -log10(p.value)) %>%
+  add_multiple_testing()
+
+# ── Lasso: season + PCs ───────────────────────────────────────────────────────
+lasso_pc <- lapply(trait_names, function(tr)
+  run_lasso_trait(analysis_df, tr, marker_names,
+                  covariates = c("Season","PC1","PC2","PC3","PC4","PC5"),
+                  seed = 123))
+names(lasso_pc) <- trait_names
+
+# ── Lasso: season only ────────────────────────────────────────────────────────
+lasso_season <- lapply(trait_names, function(tr)
+  run_lasso_trait(analysis_df, tr, marker_names,
+                  covariates = "Season", seed = 123))
+names(lasso_season) <- trait_names
+```
+
+This appendix provides the complete lists of markers selected by all four model
+specifications for each of the four cotton fibre quality traits. Tables are
+organised by trait and then by model. Within each scan table, markers are ordered
+by $p$-value. Within each lasso table, markers are ordered by the absolute value
+of the estimated coefficient.
+
+The four model specifications are:
+
+1. **Season scan (BH)** — single-marker regression with season adjustment;
+   Benjamini–Hochberg FDR threshold at 5 %.
+2. **PC scan (BH)** — single-marker regression with season and PC1–5 adjustment;
+   BH threshold at 5 %.
+3. **Lasso + PC** — lasso with season and PC1–5 as unpenalised covariates;
+   results reported for both $\lambda_{\min}$ and $\lambda_{1\text{se}}$.
+4. **Lasso season-only** — lasso with season as the sole unpenalised covariate;
+   results reported for both $\lambda_{\min}$ and $\lambda_{1\text{se}}$.
+
+Map columns (chromosome and position) are included where available from the
+genetic map file.
+
+{{< pagebreak >}}
+
+# Lint Percentage
+
+## Season scan — BH-significant markers
+
+```{r tbl-scan-season-lint}
+#| label: tbl-scan-season-lint
+#| tbl-cap: "BH-significant markers for Lint Percentage from the season-only single-marker scan, ordered by $p$-value."
+
+scan_season %>%
+  filter(trait == "Lint_percentage", sig_bh) %>%
+  arrange(p.value) %>%
+  select(SNP_ID, Chromosome, Pos_cM,
+         Estimate = estimate, SE = std.error,
+         `$t$` = statistic,
+         `$p$-value` = p.value,
+         `BH adj. $p$` = p_adj_bh) %>%
+  knitr::kable(digits = c(0, 0, 2, 4, 4, 3, 2e-300, 3),
+               format.args = list(scientific = TRUE)) %>%
+  kable_styling(latex_options = c("hold_position", "scale_down"),
+                font_size = 8)
+```
+
+## PC-adjusted scan — BH-significant markers
+
+```{r tbl-scan-pc-lint}
+#| label: tbl-scan-pc-lint
+#| tbl-cap: "BH-significant markers for Lint Percentage from the PC-adjusted single-marker scan, ordered by $p$-value."
+
+scan_pc %>%
+  filter(trait == "Lint_percentage", sig_bh) %>%
+  arrange(p.value) %>%
+  select(SNP_ID, Chromosome, Pos_cM,
+         Estimate = estimate, SE = std.error,
+         `$t$` = statistic,
+         `$p$-value` = p.value,
+         `BH adj. $p$` = p_adj_bh) %>%
+  knitr::kable(digits = c(0, 0, 2, 4, 4, 3, 2e-300, 3),
+               format.args = list(scientific = TRUE)) %>%
+  kable_styling(latex_options = c("hold_position", "scale_down"),
+                font_size = 8)
+```
+
+## Lasso with PC adjustment
+
+```{r tbl-lasso-pc-lint-min}
+#| label: tbl-lasso-pc-lint-min
+#| tbl-cap: "Markers selected by Lasso + PC for Lint Percentage under $\\lambda_{\\min}$, ordered by $|\\hat{\\beta}|$."
+
+lasso_pc[["Lint_percentage"]]$min %>%
+  left_join(map_df, by = "SNP_ID") %>%
+  arrange(desc(abs(coefficient))) %>%
+  select(SNP_ID, Chromosome, Pos_cM,
+         `$\\hat{\\beta}$` = coefficient) %>%
+  knitr::kable(digits = 4) %>%
+  kable_styling(latex_options = c("hold_position", "scale_down"),
+                font_size = 8)
+```
+
+```{r tbl-lasso-pc-lint-1se}
+#| label: tbl-lasso-pc-lint-1se
+#| tbl-cap: "Markers selected by Lasso + PC for Lint Percentage under $\\lambda_{1\\text{se}}$, ordered by $|\\hat{\\beta}|$."
+
+lasso_pc[["Lint_percentage"]]$`1se` %>%
+  left_join(map_df, by = "SNP_ID") %>%
+  arrange(desc(abs(coefficient))) %>%
+  select(SNP_ID, Chromosome, Pos_cM,
+         `$\\hat{\\beta}$` = coefficient) %>%
+  knitr::kable(digits = 4) %>%
+  kable_styling(latex_options = c("hold_position", "scale_down"),
+                font_size = 8)
+```
+
+## Lasso with season adjustment only
+
+```{r tbl-lasso-season-lint-min}
+#| label: tbl-lasso-season-lint-min
+#| tbl-cap: "Markers selected by Lasso season-only for Lint Percentage under $\\lambda_{\\min}$."
+
+lasso_season[["Lint_percentage"]]$min %>%
+  left_join(map_df, by = "SNP_ID") %>%
+  arrange(desc(abs(coefficient))) %>%
+  select(SNP_ID, Chromosome, Pos_cM,
+         `$\\hat{\\beta}$` = coefficient) %>%
+  knitr::kable(digits = 4) %>%
+  kable_styling(latex_options = c("hold_position", "scale_down"),
+                font_size = 8)
+```
+
+```{r tbl-lasso-season-lint-1se}
+#| label: tbl-lasso-season-lint-1se
+#| tbl-cap: "Markers selected by Lasso season-only for Lint Percentage under $\\lambda_{1\\text{se}}$."
+
+lasso_season[["Lint_percentage"]]$`1se` %>%
+  left_join(map_df, by = "SNP_ID") %>%
+  arrange(desc(abs(coefficient))) %>%
+  select(SNP_ID, Chromosome, Pos_cM,
+         `$\\hat{\\beta}$` = coefficient) %>%
+  knitr::kable(digits = 4) %>%
+  kable_styling(latex_options = c("hold_position", "scale_down"),
+                font_size = 8)
+```
+
+{{< pagebreak >}}
+
+# Seed Index
+
+## Season scan — BH-significant markers
+
+```{r tbl-scan-season-seed}
+#| label: tbl-scan-season-seed
+#| tbl-cap: "BH-significant markers for Seed Index from the season-only scan."
+
+scan_season %>%
+  filter(trait == "Seed_index", sig_bh) %>%
+  arrange(p.value) %>%
+  select(SNP_ID, Chromosome, Pos_cM,
+         Estimate = estimate, SE = std.error,
+         `$t$` = statistic,
+         `$p$-value` = p.value,
+         `BH adj. $p$` = p_adj_bh) %>%
+  knitr::kable(digits = c(0, 0, 2, 4, 4, 3, 2e-300, 3),
+               format.args = list(scientific = TRUE)) %>%
+  kable_styling(latex_options = c("hold_position", "scale_down"),
+                font_size = 8)
+```
+
+## PC-adjusted scan — BH-significant markers
+
+```{r tbl-scan-pc-seed}
+#| label: tbl-scan-pc-seed
+#| tbl-cap: "BH-significant markers for Seed Index from the PC-adjusted scan."
+
+scan_pc %>%
+  filter(trait == "Seed_index", sig_bh) %>%
+  arrange(p.value) %>%
+  select(SNP_ID, Chromosome, Pos_cM,
+         Estimate = estimate, SE = std.error,
+         `$t$` = statistic,
+         `$p$-value` = p.value,
+         `BH adj. $p$` = p_adj_bh) %>%
+  knitr::kable(digits = c(0, 0, 2, 4, 4, 3, 2e-300, 3),
+               format.args = list(scientific = TRUE)) %>%
+  kable_styling(latex_options = c("hold_position", "scale_down"),
+                font_size = 8)
+```
+
+## Lasso with PC adjustment
+
+```{r tbl-lasso-pc-seed-min}
+#| label: tbl-lasso-pc-seed-min
+#| tbl-cap: "Markers selected by Lasso + PC for Seed Index under $\\lambda_{\\min}$."
+
+lasso_pc[["Seed_index"]]$min %>%
+  left_join(map_df, by = "SNP_ID") %>%
+  arrange(desc(abs(coefficient))) %>%
+  select(SNP_ID, Chromosome, Pos_cM, `$\\hat{\\beta}$` = coefficient) %>%
+  knitr::kable(digits = 4) %>%
+  kable_styling(latex_options = c("hold_position", "scale_down"), font_size = 8)
+```
+
+```{r tbl-lasso-pc-seed-1se}
+#| label: tbl-lasso-pc-seed-1se
+#| tbl-cap: "Markers selected by Lasso + PC for Seed Index under $\\lambda_{1\\text{se}}$."
+
+lasso_pc[["Seed_index"]]$`1se` %>%
+  left_join(map_df, by = "SNP_ID") %>%
+  arrange(desc(abs(coefficient))) %>%
+  select(SNP_ID, Chromosome, Pos_cM, `$\\hat{\\beta}$` = coefficient) %>%
+  knitr::kable(digits = 4) %>%
+  kable_styling(latex_options = c("hold_position", "scale_down"), font_size = 8)
+```
+
+## Lasso with season adjustment only
+
+```{r tbl-lasso-season-seed-min}
+#| label: tbl-lasso-season-seed-min
+#| tbl-cap: "Markers selected by Lasso season-only for Seed Index under $\\lambda_{\\min}$."
+
+lasso_season[["Seed_index"]]$min %>%
+  left_join(map_df, by = "SNP_ID") %>%
+  arrange(desc(abs(coefficient))) %>%
+  select(SNP_ID, Chromosome, Pos_cM, `$\\hat{\\beta}$` = coefficient) %>%
+  knitr::kable(digits = 4) %>%
+  kable_styling(latex_options = c("hold_position", "scale_down"), font_size = 8)
+```
+
+```{r tbl-lasso-season-seed-1se}
+#| label: tbl-lasso-season-seed-1se
+#| tbl-cap: "Markers selected by Lasso season-only for Seed Index under $\\lambda_{1\\text{se}}$."
+
+lasso_season[["Seed_index"]]$`1se` %>%
+  left_join(map_df, by = "SNP_ID") %>%
+  arrange(desc(abs(coefficient))) %>%
+  select(SNP_ID, Chromosome, Pos_cM, `$\\hat{\\beta}$` = coefficient) %>%
+  knitr::kable(digits = 4) %>%
+  kable_styling(latex_options = c("hold_position", "scale_down"), font_size = 8)
+```
+
+{{< pagebreak >}}
+
+# Lint Index
+
+## Season scan — BH-significant markers
+
+```{r tbl-scan-season-lindex}
+#| label: tbl-scan-season-lindex
+#| tbl-cap: "BH-significant markers for Lint Index from the season-only scan."
+
+scan_season %>%
+  filter(trait == "Lint_index", sig_bh) %>%
+  arrange(p.value) %>%
+  select(SNP_ID, Chromosome, Pos_cM,
+         Estimate = estimate, SE = std.error,
+         `$t$` = statistic,
+         `$p$-value` = p.value,
+         `BH adj. $p$` = p_adj_bh) %>%
+  knitr::kable(digits = c(0, 0, 2, 4, 4, 3, 2e-300, 3),
+               format.args = list(scientific = TRUE)) %>%
+  kable_styling(latex_options = c("hold_position", "scale_down"), font_size = 8)
+```
+
+## PC-adjusted scan — BH-significant markers
+
+```{r tbl-scan-pc-lindex}
+#| label: tbl-scan-pc-lindex
+#| tbl-cap: "BH-significant markers for Lint Index from the PC-adjusted scan."
+
+scan_pc %>%
+  filter(trait == "Lint_index", sig_bh) %>%
+  arrange(p.value) %>%
+  select(SNP_ID, Chromosome, Pos_cM,
+         Estimate = estimate, SE = std.error,
+         `$t$` = statistic,
+         `$p$-value` = p.value,
+         `BH adj. $p$` = p_adj_bh) %>%
+  knitr::kable(digits = c(0, 0, 2, 4, 4, 3, 2e-300, 3),
+               format.args = list(scientific = TRUE)) %>%
+  kable_styling(latex_options = c("hold_position", "scale_down"), font_size = 8)
+```
+
+## Lasso with PC adjustment
+
+```{r tbl-lasso-pc-lindex-min}
+#| label: tbl-lasso-pc-lindex-min
+#| tbl-cap: "Markers selected by Lasso + PC for Lint Index under $\\lambda_{\\min}$."
+
+lasso_pc[["Lint_index"]]$min %>%
+  left_join(map_df, by = "SNP_ID") %>%
+  arrange(desc(abs(coefficient))) %>%
+  select(SNP_ID, Chromosome, Pos_cM, `$\\hat{\\beta}$` = coefficient) %>%
+  knitr::kable(digits = 4) %>%
+  kable_styling(latex_options = c("hold_position", "scale_down"), font_size = 8)
+```
+
+```{r tbl-lasso-pc-lindex-1se}
+#| label: tbl-lasso-pc-lindex-1se
+#| tbl-cap: "Markers selected by Lasso + PC for Lint Index under $\\lambda_{1\\text{se}}$."
+
+lasso_pc[["Lint_index"]]$`1se` %>%
+  left_join(map_df, by = "SNP_ID") %>%
+  arrange(desc(abs(coefficient))) %>%
+  select(SNP_ID, Chromosome, Pos_cM, `$\\hat{\\beta}$` = coefficient) %>%
+  knitr::kable(digits = 4) %>%
+  kable_styling(latex_options = c("hold_position", "scale_down"), font_size = 8)
+```
+
+## Lasso with season adjustment only
+
+```{r tbl-lasso-season-lindex-min}
+#| label: tbl-lasso-season-lindex-min
+#| tbl-cap: "Markers selected by Lasso season-only for Lint Index under $\\lambda_{\\min}$."
+
+lasso_season[["Lint_index"]]$min %>%
+  left_join(map_df, by = "SNP_ID") %>%
+  arrange(desc(abs(coefficient))) %>%
+  select(SNP_ID, Chromosome, Pos_cM, `$\\hat{\\beta}$` = coefficient) %>%
+  knitr::kable(digits = 4) %>%
+  kable_styling(latex_options = c("hold_position", "scale_down"), font_size = 8)
+```
+
+```{r tbl-lasso-season-lindex-1se}
+#| label: tbl-lasso-season-lindex-1se
+#| tbl-cap: "Markers selected by Lasso season-only for Lint Index under $\\lambda_{1\\text{se}}$."
+
+lasso_season[["Lint_index"]]$`1se` %>%
+  left_join(map_df, by = "SNP_ID") %>%
+  arrange(desc(abs(coefficient))) %>%
+  select(SNP_ID, Chromosome, Pos_cM, `$\\hat{\\beta}$` = coefficient) %>%
+  knitr::kable(digits = 4) %>%
+  kable_styling(latex_options = c("hold_position", "scale_down"), font_size = 8)
+```
+
+{{< pagebreak >}}
+
+# Seed Oil Content
+
+## Season scan — BH-significant markers
+
+```{r tbl-scan-season-oil}
+#| label: tbl-scan-season-oil
+#| tbl-cap: "BH-significant markers for Seed Oil Content from the season-only scan."
+
+scan_season %>%
+  filter(trait == "Seed_oil_content", sig_bh) %>%
+  arrange(p.value) %>%
+  select(SNP_ID, Chromosome, Pos_cM,
+         Estimate = estimate, SE = std.error,
+         `$t$` = statistic,
+         `$p$-value` = p.value,
+         `BH adj. $p$` = p_adj_bh) %>%
+  knitr::kable(digits = c(0, 0, 2, 4, 4, 3, 2e-300, 3),
+               format.args = list(scientific = TRUE)) %>%
+  kable_styling(latex_options = c("hold_position", "scale_down"), font_size = 8)
+```
+
+## PC-adjusted scan — BH-significant markers
+
+```{r tbl-scan-pc-oil}
+#| label: tbl-scan-pc-oil
+#| tbl-cap: "BH-significant markers for Seed Oil Content from the PC-adjusted scan."
+
+scan_pc %>%
+  filter(trait == "Seed_oil_content", sig_bh) %>%
+  arrange(p.value) %>%
+  select(SNP_ID, Chromosome, Pos_cM,
+         Estimate = estimate, SE = std.error,
+         `$t$` = statistic,
+         `$p$-value` = p.value,
+         `BH adj. $p$` = p_adj_bh) %>%
+  knitr::kable(digits = c(0, 0, 2, 4, 4, 3, 2e-300, 3),
+               format.args = list(scientific = TRUE)) %>%
+  kable_styling(latex_options = c("hold_position", "scale_down"), font_size = 8)
+```
+
+## Lasso with PC adjustment
+
+```{r tbl-lasso-pc-oil-min}
+#| label: tbl-lasso-pc-oil-min
+#| tbl-cap: "Markers selected by Lasso + PC for Seed Oil Content under $\\lambda_{\\min}$."
+
+lasso_pc[["Seed_oil_content"]]$min %>%
+  left_join(map_df, by = "SNP_ID") %>%
+  arrange(desc(abs(coefficient))) %>%
+  select(SNP_ID, Chromosome, Pos_cM, `$\\hat{\\beta}$` = coefficient) %>%
+  knitr::kable(digits = 4) %>%
+  kable_styling(latex_options = c("hold_position", "scale_down"), font_size = 8)
+```
+
+```{r tbl-lasso-pc-oil-1se}
+#| label: tbl-lasso-pc-oil-1se
+#| tbl-cap: "Markers selected by Lasso + PC for Seed Oil Content under $\\lambda_{1\\text{se}}$."
+
+lasso_pc[["Seed_oil_content"]]$`1se` %>%
+  left_join(map_df, by = "SNP_ID") %>%
+  arrange(desc(abs(coefficient))) %>%
+  select(SNP_ID, Chromosome, Pos_cM, `$\\hat{\\beta}$` = coefficient) %>%
+  knitr::kable(digits = 4) %>%
+  kable_styling(latex_options = c("hold_position", "scale_down"), font_size = 8)
+```
+
+## Lasso with season adjustment only
+
+```{r tbl-lasso-season-oil-min}
+#| label: tbl-lasso-season-oil-min
+#| tbl-cap: "Markers selected by Lasso season-only for Seed Oil Content under $\\lambda_{\\min}$."
+
+lasso_season[["Seed_oil_content"]]$min %>%
+  left_join(map_df, by = "SNP_ID") %>%
+  arrange(desc(abs(coefficient))) %>%
+  select(SNP_ID, Chromosome, Pos_cM, `$\\hat{\\beta}$` = coefficient) %>%
+  knitr::kable(digits = 4) %>%
+  kable_styling(latex_options = c("hold_position", "scale_down"), font_size = 8)
+```
+
+```{r tbl-lasso-season-oil-1se}
+#| label: tbl-lasso-season-oil-1se
+#| tbl-cap: "Markers selected by Lasso season-only for Seed Oil Content under $\\lambda_{1\\text{se}}$."
+
+lasso_season[["Seed_oil_content"]]$`1se` %>%
+  left_join(map_df, by = "SNP_ID") %>%
+  arrange(desc(abs(coefficient))) %>%
+  select(SNP_ID, Chromosome, Pos_cM, `$\\hat{\\beta}$` = coefficient) %>%
+  knitr::kable(digits = 4) %>%
+  kable_styling(latex_options = c("hold_position", "scale_down"), font_size = 8)
+```
+
+{{< pagebreak >}}
+
+# Cross-Trait Summary
+
+## Markers appearing in multiple traits (scan, BH-significant)
+
+```{r tbl-shared-scan-markers}
+#| label: tbl-shared-scan-markers
+#| tbl-cap: "Markers that are BH-significant in two or more traits under the PC-adjusted scan, with their estimated effects per trait."
+
+shared_scan <- scan_pc %>%
+  filter(sig_bh) %>%
+  group_by(SNP_ID) %>%
+  filter(n_distinct(trait) >= 2) %>%
+  ungroup() %>%
+  select(SNP_ID, trait, Chromosome, Pos_cM, estimate, p.value, p_adj_bh) %>%
+  mutate(trait = gsub("_", " ", trait)) %>%
+  arrange(SNP_ID, trait)
+
+if (nrow(shared_scan) == 0) {
+  cat("No markers are BH-significant in two or more traits simultaneously.")
+} else {
+  shared_scan %>%
+    rename(Trait = trait, Estimate = estimate,
+           `$p$` = p.value, `BH adj. $p$` = p_adj_bh) %>%
+    knitr::kable(digits = 4) %>%
+    kable_styling(latex_options = c("hold_position", "scale_down"), font_size = 8)
+}
+```
+
+## Markers appearing in multiple traits (lasso, $\lambda_{1\text{se}}$)
+
+```{r tbl-shared-lasso-markers}
+#| label: tbl-shared-lasso-markers
+#| tbl-cap: "Markers selected by Lasso + PC ($\\lambda_{1\\text{se}}$) in two or more traits."
+
+lasso_1se_long <- bind_rows(lapply(trait_names, function(tr) {
+  lasso_pc[[tr]]$`1se` %>%
+    mutate(trait = gsub("_", " ", tr))
+}))
+
+shared_lasso <- lasso_1se_long %>%
+  group_by(SNP_ID) %>%
+  filter(n_distinct(trait) >= 2) %>%
+  ungroup() %>%
+  left_join(map_df, by = "SNP_ID") %>%
+  select(SNP_ID, Chromosome, Pos_cM, trait, coefficient) %>%
+  arrange(SNP_ID, trait)
+
+if (nrow(shared_lasso) == 0) {
+  cat("No markers are selected by lasso in two or more traits simultaneously.")
+} else {
+  shared_lasso %>%
+    rename(Trait = trait, `$\\hat{\\beta}$` = coefficient) %>%
+    knitr::kable(digits = 4) %>%
+    kable_styling(latex_options = c("hold_position", "scale_down"), font_size = 8)
+}
+```
+
+## Overall selection count summary
+
+```{r tbl-overall-count-summary}
+#| label: tbl-overall-count-summary
+#| tbl-cap: "Total number of markers selected by each method and trait combination. Scan results use the BH threshold; lasso results are shown for both $\\lambda$ rules."
+
+count_summary <- bind_rows(
+  lapply(trait_names, function(tr) {
+    tibble(
+      Trait                    = gsub("_", " ", tr),
+      `Season scan (BH)`       = sum(scan_season$trait == tr & scan_season$sig_bh,
+                                     na.rm = TRUE),
+      `PC scan (BH)`           = sum(scan_pc$trait     == tr & scan_pc$sig_bh,
+                                     na.rm = TRUE),
+      `Lasso+PC (min)`         = nrow(lasso_pc[[tr]]$min),
+      `Lasso+PC (1se)`         = nrow(lasso_pc[[tr]]$`1se`),
+      `Lasso season (min)`     = nrow(lasso_season[[tr]]$min),
+      `Lasso season (1se)`     = nrow(lasso_season[[tr]]$`1se`)
+    )
+  })
+)
+
+knitr::kable(count_summary) %>%
+  kable_styling(latex_options = "hold_position", font_size = 9)
+```
