@@ -1,0 +1,1342 @@
+---
+title: "QTL Mapping of Cotton Fibre Quality Traits: A Comparison of Classical and Regularised Approaches"
+author: "Shiyan Miao"
+date: today
+format:
+  pdf:
+    documentclass: article
+    toc: true
+    toccolor: "blue"
+    lof: true
+    lot: true
+    colorlinks: true
+    link-citations: true
+    number-sections: true
+    number-depth: 3
+    keep-tex: false
+    geometry:
+      - margin=1in
+    include-in-header:
+      text: |
+        \usepackage{caption}
+        \captionsetup{
+          font       = {small, sf},
+          labelfont  = {bf, sf},
+          labelsep   = period,
+          skip       = 4pt
+        }
+execute:
+  echo: false
+  warning: false
+  message: false
+editor: visual
+bibliography: references.bib
+---
+
+```{r setup}
+library(tidyverse)
+library(data.table)
+library(glmnet)
+library(broom)
+library(knitr)
+library(kableExtra)
+library(scales)
+library(irlba)
+library(gt)
+library(gtsummary)
+library(GGally)
+library(glue)
+library(purrr)
+library(patchwork)
+
+set.seed(2026)
+
+knitr::opts_chunk$set(
+  fig.align = "center",
+  fig.width  = 8,
+  fig.height = 5,
+  out.width  = "90%"
+)
+
+geno_file  <- "Genotype_data.txt"
+map_file   <- "Genetic_map.txt"
+pheno_file <- "Phenotype_data.txt"
+
+options(knitr.kable.NA = "—")
+options(kableExtra.latex.load_packages = FALSE)
+```
+
+```{r load-data}
+# ── Raw import ─────────────────────────────────────────────────────────────
+geno_raw  <- fread(geno_file, header = FALSE)
+map_df    <- fread(map_file)
+# Standardise column names positionally to avoid conflicts with ggplot2::Position
+names(map_df) <- c("SNP_ID", "Chromosome", "Pos_cM")
+pheno_raw <- fread(pheno_file)
+
+# ── Genotype matrix ─────────────────────────────────────────────────────────
+stopifnot(ncol(geno_raw) == nrow(map_df))
+
+geno_df           <- as.data.frame(geno_raw)
+colnames(geno_df) <- map_df$SNP_ID
+geno_df$Line      <- seq_len(nrow(geno_df))
+
+n_lines <- nrow(geno_df)
+n_pheno <- nrow(pheno_raw)
+
+# ── Phenotype data frame with season labels ──────────────────────────────────
+pheno_df <- pheno_raw %>%
+  mutate(
+    RowID  = row_number(),
+    Season = case_when(
+      RowID <= n_lines           ~ "Season_1",
+      RowID <= 2 * n_lines       ~ "Season_2",
+      TRUE                       ~ "Season_3"
+    ),
+    Line = rep(seq_len(n_lines), times = n_pheno / n_lines)
+  ) %>%
+  relocate(Line, Season, RowID)
+
+# ── Merge to analysis dataset ────────────────────────────────────────────────
+ analysis_df <- pheno_df %>%
+  left_join(geno_df, by = "Line")
+
+trait_names <- c(
+  "Lint_percentage",
+  "Seed_index",
+  "Lint_index",
+  "Seed_oil_content"
+)
+```
+
+# Introduction
+
+Quantitative trait locus (QTL) mapping aims to identify regions of the genome that explain variation in complex phenotypic traits. In the classical framework described by @HaleyKnott1992, single markers are tested one at a time through regression of phenotype on genotype score. @Broman2002 later placed this single-marker approach within a broader framework that includes interval mapping and multiple-QTL model selection. These classical methods were designed for relatively small marker panels in structured populations such as backcross or F2 designs, where the number of markers is modest relative to the number of genotyped individuals.
+
+Modern plant breeding populations and dense genotyping arrays present a qualitatively different challenge. When the number of markers $p$ substantially exceeds the number of genotyped lines $n$, ordinary regression becomes underdetermined and the assumption of independent tests is badly violated. In this high-dimensional regime, classical single-marker approaches still serve as a transparent baseline, but they must be accompanied by methods that account for marker correlation and select markers jointly rather than one at a time.
+
+This report analyses a cotton MAGIC (Multi-parent Advanced Generation Inter-Cross) population genotyped with a dense marker panel and phenotyped for four fibre quality traits across three field seasons[@LiData2022]. The dataset contains 256 genotyped lines and 6,523 markers, so $p/n \approx 25$. The phenotype file stacks three seasons, giving 768 observations in total. The four traits analysed are lint percentage, seed index, lint index, and seed oil content. Whether these classical approaches remain useful as screening tools under dense-marker, repeated-season cotton data is therefore an empirical question rather than an assumption.
+
+Three complementary marker selection strategies are evaluated. The first is a classical single-marker scan that adjusts only for season. The second extends this scan by also adjusting for the leading principal components (PCs) of the genotype matrix, thereby controlling for broad population structure. The third is a lasso-penalised multi-marker regression that selects markers jointly under sparsity constraints. To understand how these methods compare under known ground truth, a simulation-based power analysis is conducted using the real genotype matrix as the genetic backbone.
+
+The goals of this report are fourfold. First, it describes the structure of the genotype, map, and phenotype data and presents an exploratory analysis of the phenotypic traits. Second, it formally defines each method and the performance indices used to compare them. Third, it reports the number of markers selected by each method, the consistency of selected sets across methods, and the simulation-based power results. Finally, it discusses the substantive implications, connects the findings to the existing literature on cotton QTL mapping, and identifies limitations and directions for future work.
+
+# Data
+
+## Raw data and design structure
+
+The dataset comprises three files. The genotype file contains 256 cotton lines genotyped at 6,523 SNP markers, giving a marker-to-line ratio of approximately 25:1. The genetic map file provides the chromosomal address (chromosome and position in cM) for each of the 6,523 markers. The phenotype file contains 768 records across four traits — lint percentage, seed index, lint index, and seed oil content — which is exactly three times the number of genotyped lines, indicating that each of the 256 lines was phenotyped in three separate field seasons. The merged analysis dataset therefore has 768 rows (one per line–season combination) and retains all 6,523 marker columns alongside the phenotype and design variables.
+
+Prior to analysis, several preprocessing steps were applied to the genotype data. First, missing marker values were replaced by the column mean across all lines, so that no observations were lost due to sporadic missing genotype calls. Second, markers with zero variance across all 256 lines were removed, as they carry no information for regression. These two steps together ensure a numerically stable marker matrix for all downstream models. The phenotype data required no imputation, as all 768 records were complete. The season indicator was reconstructed by assigning the first 256 rows to Season 1, the next 256 to Season 2, and the final 256 to Season 3, consistent with a balanced multi-environment trial design. All analyses were conducted in R [@RCoreTeam2024] using the following packages: `glmnet` [@Friedman2010] for lasso regression, `irlba` for truncated PCA, `gtsummary` and `kableExtra` for table formatting, and the `tidyverse` suite for data manipulation and visualisation.
+
+The phenotype data are structured as a randomised multi-environment trial across three field seasons. Seasonal effects in such designs can shift trait means substantially and must be treated as a structured nuisance factor rather than random noise. All regression models described in @sec-methods therefore include season as an adjustment covariate.
+
+## Exploratory analysis of phenotypic traits {#sec-eda}
+
+```{r tbl-trait-summary-by-season}
+#| label: tbl-trait-summary-by-season
+#| tbl-cap: "Descriptive statistics for the four analysed traits by field season and overall."
+
+analysis_df %>%
+  select(Season, all_of(trait_names)) %>%
+  mutate(
+    Season = factor(
+      Season,
+      levels = c("Season_1", "Season_2", "Season_3"),
+      labels = c("Season 1", "Season 2", "Season 3")
+    )
+  ) %>%
+  tbl_summary(
+    by      = Season,
+    include = all_of(trait_names),
+    type    = all_continuous() ~ "continuous2",
+    statistic = all_continuous() ~ c(
+      "{mean} ({sd})",
+      "{median} [{min}, {max}]"
+    ),
+    digits  = all_continuous() ~ 2,
+    label   = list(
+      Lint_percentage  ~ "Lint percentage",
+      Seed_index       ~ "Seed index",
+      Lint_index       ~ "Lint index",
+      Seed_oil_content ~ "Seed oil content"
+    ),
+    missing = "no"
+  ) %>%
+  add_overall(last = TRUE) %>%
+  bold_labels() %>%
+  modify_header(label ~ "**Trait**") %>%
+  modify_spanning_header(all_stat_cols() ~ "**Season / Overall**") %>%
+  # ── key change: as_kable_extra() instead of as_gt() ──────────────────────
+  as_kable_extra(
+    booktabs  = TRUE,
+    longtable = FALSE,
+    linesep   = ""
+  ) %>%
+  kable_styling(
+    latex_options = c("HOLD_position", "scale_down"),  # fixes both problems
+    font_size     = 9,
+    full_width    = TRUE
+  ) %>%
+  column_spec(1, width = "4.5cm") %>%          # fix trait-name column width
+  column_spec(2:5, width = "3.0cm")            # fix season/overall columns
+```
+
+@tbl-trait-summary-by-season reports means and ranges by season and overall. Lint percentage is substantially lower in Season 1 (mean 39.50) than in Seasons 2 and 3 (means 43.91 and 43.93 respectively). Seed index follows the opposite pattern, being highest in Season 1 (9.58) and declining in later seasons. Lint index is relatively stable across seasons with means between 7.54 and 7.66. Seed oil content is lowest in Season 2 (18.38) and clearly highest in Season 3 (21.68). These patterns show that season effects are large enough to shift trait means meaningfully, which directly motivates the inclusion of a season covariate in all models.
+
+```{r fig-trait-pairs}
+#| label: fig-trait-pairs
+#| fig-cap: "Pairwise scatterplot matrix for the four analysed traits, coloured by season (S1 = Season 1, S2 = Season 2, S3 = Season 3). Lower-triangular panels show raw scatterplots of individual observations. Diagonal panels show season-specific kernel density curves. Upper-triangular panels report the overall Pearson correlation (Cor) together with within-season correlations for each of the three field seasons."
+#| fig-width: 7.5
+#| fig-height: 7.5
+#| fig-pos: "H"
+#| out-width: "88%"
+
+trait_plot_df <- analysis_df %>%
+  select(Season, all_of(trait_names)) %>%
+  mutate(
+    Season = factor(Season,
+                    levels = c("Season_1", "Season_2", "Season_3"),
+                    labels = c("S1", "S2", "S3"))
+  )
+
+cor_panel_by_season <- function(data, mapping, ...) {
+  x   <- GGally::eval_data_col(data, mapping$x)
+  y   <- GGally::eval_data_col(data, mapping$y)
+  grp <- data$Season
+
+  cor_safe <- function(a, b) {
+    ok <- complete.cases(a, b)
+    if (sum(ok) < 3) return(NA_real_)
+    cor(a[ok], b[ok])
+  }
+
+  cor_all    <- cor_safe(x, y)
+  cor_by_grp <- split(seq_along(x), grp) |>
+    purrr::map_dbl(~ cor_safe(x[.x], y[.x]))
+
+  lab <- paste0(
+    "Cor: ", sprintf("%.3f", cor_all), "\n",
+    paste(names(cor_by_grp), sprintf("%.3f", cor_by_grp),
+          sep = ": ", collapse = "\n")
+  )
+
+  ggplot2::ggplot() +
+    ggplot2::annotate("text", x = 0.05, y = 0.95, label = lab,
+                      hjust = 0, vjust = 1, size = 3.2, lineheight = 1.3) +
+    ggplot2::xlim(0, 1) + ggplot2::ylim(0, 1) +
+    ggplot2::theme_void()
+}
+
+GGally::ggpairs(
+  trait_plot_df,
+  columns      = 2:5,
+  mapping      = ggplot2::aes(colour = Season, fill = Season),
+  columnLabels = c("Lint %", "Seed index", "Lint index", "Seed oil"),
+  lower  = list(continuous = GGally::wrap("points", alpha = 0.45, size = 0.5)),
+  diag   = list(continuous = GGally::wrap("densityDiag", alpha = 0.40)),
+  upper  = list(continuous = cor_panel_by_season)
+) +
+  ggplot2::theme_bw(base_size = 9) +
+  ggplot2::theme(
+    legend.position  = "bottom",
+    panel.grid       = ggplot2::element_blank(),
+    strip.background = ggplot2::element_rect(fill = "grey90"),
+    legend.key.size  = ggplot2::unit(0.4, "cm")
+  )
+```
+
+@fig-trait-pairs displays the corresponding joint distributions stratified by field season.
+
+The dominant feature is the strong negative correlation between lint percentage and seed index ($r = -0.778$). The lower-left scatterplot panel of @fig-trait-pairs confirms that this relationship is linear and consistent across all three field seasons, with within-season correlations of $-0.504$, $-0.462$, and $-0.570$ for Seasons 1, 2, and 3, respectively. This pattern is biologically interpretable as a source--sink trade-off: carbon assimilates directed toward elongating lint fibres are unavailable for seed filling, so lines with higher lint productivity tend to produce lighter seeds. Because this negative association persists within each season, it reflects a stable genetic constraint rather than a transient environmental response.
+
+The second notable association is a moderate positive correlation between lint percentage and lint index ($r = 0.354$), with within-season values ranging from $0.381$ to $0.494$. Both traits measure aspects of fibre productivity, so their positive co-variation is expected: lines that produce a greater proportion of lint also tend to produce heavier lint per seed.
+
+One pair of traits warrants particular attention owing to an apparent paradox. Seed index and seed oil content show a weakly negative overall correlation ($r = -0.277$), yet the within-season correlations reported in @fig-trait-pairs are uniformly positive ($+0.132$ to $+0.184$ across the three seasons). This reversal of sign arises because seed index is substantially higher in Season 1 while seed oil content is substantially lower in Season 1, so pooling all seasons without adjustment creates a spurious negative association that disappears once season is held constant. This is a direct statistical justification for treating season as a fixed-effect covariate in all downstream regression models.
+
+@fig-trait-pairs indicate that the four traits capture largely distinct biological dimensions and are therefore worth analysing separately. The presence of a strong genetic trade-off between lint percentage and seed index also suggests that genomic regions identified for one trait may exert antagonistic or pleiotropic effects on the other, a possibility that motivates the multi-method comparison adopted in the Results section.
+
+## Genotype principal component analysis {#sec-pca}
+
+Before fitting any marker models, it is important to characterise the broad genomic structure of the 256 cotton lines. A principal component analysis (PCA) of the standardised genotype matrix is used for this purpose.
+
+```{r compute-pca}
+# ── Prepare genotype matrix ───────────────────────────────────────────────────
+X_geno      <- geno_df %>% select(-Line) %>% as.matrix()
+mode(X_geno) <- "numeric"
+
+# Mean-impute missing values
+for (j in seq_len(ncol(X_geno))) {
+  miss_idx <- is.na(X_geno[, j])
+  if (any(miss_idx)) X_geno[miss_idx, j] <- mean(X_geno[, j], na.rm = TRUE)
+}
+
+# Remove zero-variance markers
+marker_keep  <- apply(X_geno, 2, function(x) var(x, na.rm = TRUE) > 0)
+X_geno       <- X_geno[, marker_keep, drop = FALSE]
+marker_names <- colnames(X_geno)
+
+# PCA via truncated SVD (reproducible with set.seed)
+set.seed(123)
+pca_fit <- prcomp_irlba(
+  x       = scale(X_geno, center = TRUE, scale = TRUE),
+  n       = 20,
+  center  = FALSE,
+  scale.  = FALSE
+)
+
+# Variance explained
+var_explained     <- (pca_fit$sdev^2) / sum(pca_fit$sdev^2)
+cum_var_explained <- cumsum(var_explained)
+
+pca_var_df <- tibble(
+  PC         = seq_along(var_explained),
+  Var_Expl   = var_explained,
+  Cumulative = cum_var_explained
+)
+
+# PC scores and line-averaged trait values
+pca_scores <- as_tibble(pca_fit$x[, 1:5, drop = FALSE]) %>%
+  setNames(paste0("PC", 1:5)) %>%
+  mutate(Line = seq_len(n()))
+
+trait_line_mean <- pheno_df %>%
+  group_by(Line) %>%
+  summarise(across(all_of(trait_names), ~ mean(.x, na.rm = TRUE)), .groups = "drop")
+
+pca_scores <- pca_scores %>%
+  left_join(trait_line_mean, by = "Line")
+
+# Attach PCs to analysis_df
+pc_line_df  <- pca_scores %>% select(Line, PC1, PC2, PC3, PC4, PC5)
+analysis_df <- analysis_df %>%
+  select(-any_of(paste0("PC", 1:5))) %>%
+  left_join(pc_line_df, by = "Line") %>%
+  mutate(Season = factor(Season))
+```
+
+```{r fig-pca-scree}
+#| label: fig-pca-scree
+#| fig-cap: "Scree plot showing the proportion of genotype variance explained by each of the first 20 principal components."
+#| fig-pos: "H"
+#| fig-width: 7
+#| fig-height: 3.5
+#| out-width: "78%"
+ggplot(pca_var_df, aes(x = PC, y = Var_Expl)) +
+  geom_col(fill = "steelblue") +
+  labs(
+    title = "Scree Plot — Genotype PCA",
+    x     = "Principal Component",
+    y     = "Proportion of Variance Explained"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+@fig-pca-scree shows that the proportion of variance explained declines gradually rather than dropping sharply after the first component. This pattern is characteristic of complex multi-parent breeding populations in which genetic diversity is spread across many dimensions rather than being dominated by a single axis of differentiation.
+
+```{r fig-pca-scatter}
+#| label: fig-pca-scatter
+#| fig-cap: "Scatterplot of the first two genotype principal components (left) and PC1 vs PC3 (right). Each point represents one of the 256 genotyped cotton lines."
+#| fig-width: 9
+#| fig-height: 4
+#| fig-pos: "H"
+#| out-width: "95%"
+
+p_pc12 <- ggplot(pca_scores, aes(x = PC1, y = PC2)) +
+  geom_point(alpha = 0.7, colour = "steelblue") +
+  labs(title = "PC1 vs PC2", x = "PC1", y = "PC2") +
+  theme_minimal(base_size = 12)
+
+p_pc13 <- ggplot(pca_scores, aes(x = PC1, y = PC3)) +
+  geom_point(alpha = 0.7, colour = "darkorange") +
+  labs(title = "PC1 vs PC3", x = "PC1", y = "PC3") +
+  theme_minimal(base_size = 12)
+
+patchwork::wrap_plots(p_pc12, p_pc13, ncol = 2)
+```
+
+```{r fig-pc-trait}
+#| label: fig-pc-trait
+#| fig-cap: "Left: scatterplot of PC1 vs PC2 coloured by line-averaged lint percentage, showing no strong monotonic gradient across the PC space. Right: heatmap of Pearson correlations between the first five genotype PCs and the four analysed traits; values near zero indicate that population structure does not primarily drive trait variation."
+#| fig-width: 10
+#| fig-height: 4.5
+#| fig-pos: "H"
+#| out-width: "98%"
+
+p_lint <- ggplot(pca_scores, aes(x = PC1, y = PC2, colour = Lint_percentage)) +
+  geom_point(size = 2, alpha = 0.8) +
+  scale_colour_viridis_c(option = "plasma") +
+  labs(
+    title  = "PC1 vs PC2 — coloured by lint %",
+    x      = "PC1", y = "PC2", colour = "Lint %"
+  ) +
+  theme_minimal(base_size = 11)
+
+pc_trait_df <- pca_scores %>%
+  select(PC1, PC2, PC3, PC4, PC5,
+         Lint_percentage, Seed_index, Lint_index, Seed_oil_content)
+
+cor_mat <- cor(pc_trait_df, use = "pairwise.complete.obs")
+
+cor_df <- as.data.frame(cor_mat) %>%
+  rownames_to_column("Var1") %>%
+  pivot_longer(-Var1, names_to = "Var2", values_to = "Correlation") %>%
+  filter(
+    Var1 %in% paste0("PC", 1:5),
+    Var2 %in% c("Lint_percentage", "Seed_index",
+                 "Lint_index", "Seed_oil_content")
+  ) %>%
+  mutate(Var2 = gsub("_", " ", Var2))
+
+p_heat <- ggplot(cor_df, aes(x = Var1, y = Var2, fill = Correlation)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = sprintf("%.2f", Correlation)), size = 3.8) +
+  scale_fill_gradient2(low = "darkblue", mid = "white", high = "darkred",
+                       midpoint = 0, limits = c(-1, 1)) +
+  labs(title = "PC–Trait Correlations", x = NULL, y = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 0))
+
+patchwork::wrap_plots(p_lint, p_heat, ncol = 2, widths = c(1, 1))
+```
+
+@fig-pca-scatter shows that the 256 lines display meaningful spread across both PC axes without forming a small number of sharply separated clusters. This indicates real but moderate population structure, which justifies PC adjustment as a robustness check without implying that the data come from completely distinct genetic groups. In @fig-pc-trait, lint percentage does not follow a strong monotonic gradient across the PC space, suggesting that broad genotype structure does not fully account for trait variation. This expectation is later confirmed by the model comparison, where lint percentage retains strong marker associations even after PC adjustment. The heatmap of PC–trait correlations shows that the first two PCs have at most moderate associations with any trait, further supporting the interpretation that trait variation reflects more than just population stratification.
+
+# Methods {#sec-methods}
+
+```{r helper-functions}
+# ── Utility: prepare marker matrix with mean imputation ──────────────────────
+prep_marker_matrix <- function(df, marker_names) {
+  df <- as.data.frame(df)
+  X  <- as.matrix(df[, marker_names, drop = FALSE])
+  mode(X) <- "numeric"
+
+  if (anyNA(X)) {
+    col_means <- colMeans(X, na.rm = TRUE)
+    idx       <- which(is.na(X), arr.ind = TRUE)
+    X[idx]    <- col_means[idx[, 2]]
+  }
+  X
+}
+
+# ── Fast single-marker scan via QR residualisation ──────────────────────────
+fast_single_marker_scan_cov <- function(df, trait, marker_names,
+                                        covariates = "Season") {
+  df          <- as.data.frame(df)
+  needed_cols <- unique(c(trait, covariates, marker_names))
+  df          <- df[, needed_cols, drop = FALSE]
+  keep        <- complete.cases(df[, c(trait, covariates), drop = FALSE])
+  df          <- df[keep, , drop = FALSE]
+
+  y   <- df[[trait]]
+  X   <- prep_marker_matrix(df, marker_names)
+  C   <- model.matrix(as.formula(paste("~", paste(covariates, collapse = " + "))),
+                      data = df)
+  qrC <- qr(C)
+
+  y_res <- qr.resid(qrC, y)
+  X_res <- qr.resid(qrC, X)
+
+  Sxx     <- colSums(X_res^2)
+  Sxy     <- as.vector(crossprod(X_res, y_res))
+  Syy     <- sum(y_res^2)
+  df_res  <- nrow(df) - qrC$rank - 1L
+  valid   <- Sxx > 1e-12
+
+  beta <- rss <- se <- tval <- pval <- rep(NA_real_, length(marker_names))
+  beta[valid]  <- Sxy[valid] / Sxx[valid]
+  rss[valid]   <- pmax(Syy - Sxy[valid]^2 / Sxx[valid], 0)
+  se[valid]    <- sqrt((rss[valid] / df_res) / Sxx[valid])
+  tval[valid]  <- beta[valid] / se[valid]
+  pval[valid]  <- 2 * pt(abs(tval[valid]), df = df_res, lower.tail = FALSE)
+
+  tibble(
+    trait      = trait,
+    SNP_ID     = marker_names,
+    estimate   = beta,
+    std.error  = se,
+    statistic  = tval,
+    p.value    = pval,
+    covariates = paste(covariates, collapse = " + "),
+    df_resid   = df_res
+  )
+}
+
+# ── Multiple-testing correction ──────────────────────────────────────────────
+add_multiple_testing <- function(scan_df, alpha = 0.05) {
+  scan_df %>%
+    group_by(trait, covariates) %>%
+    arrange(p.value, .by_group = TRUE) %>%
+    mutate(
+      p_adj_bh   = p.adjust(p.value, method = "BH"),
+      p_adj_bonf = p.adjust(p.value, method = "bonferroni"),
+      sig_raw    = p.value   < alpha,
+      sig_bh     = p_adj_bh  < alpha,
+      sig_bonf   = p_adj_bonf < alpha
+    ) %>%
+    ungroup()
+}
+
+# ── Select marker set from scan ──────────────────────────────────────────────
+select_marker_set <- function(scan_df, trait_name,
+                              rule = c("bh", "bonf", "top"), top_n = 50) {
+  rule <- match.arg(rule)
+  df   <- scan_df %>% filter(trait == trait_name) %>% arrange(p.value)
+  if (rule == "bh")   return(df %>% filter(sig_bh)   %>% pull(SNP_ID) %>% unique())
+  if (rule == "bonf") return(df %>% filter(sig_bonf) %>% pull(SNP_ID) %>% unique())
+  df %>% slice_head(n = top_n) %>% pull(SNP_ID) %>% unique()
+}
+
+# ── Lasso with penalised markers and unpenalised covariates ─────────────────
+run_lasso_trait <- function(df, trait, marker_names,
+                            covariates = c("Season", "PC1", "PC2",
+                                           "PC3", "PC4", "PC5"),
+                            alpha = 1, nfolds = 10, seed = 123) {
+  df   <- as.data.frame(df)
+  keep <- complete.cases(df[, c(trait, covariates), drop = FALSE])
+  df   <- df[keep, , drop = FALSE]
+
+  y        <- df[[trait]]
+  X_marker <- prep_marker_matrix(df, marker_names)
+  X_cov    <- model.matrix(reformulate(covariates), data = df)[, -1, drop = FALSE]
+  x_all    <- cbind(X_cov, X_marker)
+
+  cov_names      <- colnames(X_cov)
+  penalty_factor <- c(rep(0, ncol(X_cov)), rep(1, ncol(X_marker)))
+
+  set.seed(seed)
+  cvfit <- cv.glmnet(
+    x              = x_all,
+    y              = y,
+    family         = "gaussian",
+    alpha          = alpha,
+    nfolds         = nfolds,
+    standardize    = TRUE,
+    intercept      = TRUE,
+    penalty.factor = penalty_factor
+  )
+
+  coef_min <- coef(cvfit, s = "lambda.min")
+  coef_1se <- coef(cvfit, s = "lambda.1se")
+  nz_min   <- setdiff(rownames(coef_min)[as.vector(coef_min != 0)], "(Intercept)")
+  nz_1se   <- setdiff(rownames(coef_1se)[as.vector(coef_1se != 0)], "(Intercept)")
+
+  tibble(
+    trait                    = trait,
+    lambda_min               = cvfit$lambda.min,
+    lambda_1se               = cvfit$lambda.1se,
+    n_selected_markers_min   = length(setdiff(nz_min, cov_names)),
+    n_selected_markers_1se   = length(setdiff(nz_1se, cov_names)),
+    covariates_nonzero_min   = list(intersect(nz_min, cov_names)),
+    covariates_nonzero_1se   = list(intersect(nz_1se, cov_names)),
+    selected_markers_min     = list(setdiff(nz_min, cov_names)),
+    selected_markers_1se     = list(setdiff(nz_1se, cov_names)),
+    cvfit                    = list(cvfit)
+  )
+}
+
+get_lasso_markers <- function(lasso_tbl, trait_name,
+                              rule = c("1se", "min")) {
+  rule <- match.arg(rule)
+  col  <- if (rule == "1se") "selected_markers_1se" else "selected_markers_min"
+  out  <- lasso_tbl %>% filter(trait == trait_name) %>% pull(col)
+  if (length(out) == 0) return(character(0))
+  unique(out[[1]])
+}
+
+# ── Jaccard similarity ───────────────────────────────────────────────────────
+jaccard_index <- function(a, b) {
+  a <- unique(a); b <- unique(b)
+  u <- length(union(a, b))
+  if (u == 0) return(NA_real_)
+  length(intersect(a, b)) / u
+}
+
+# ── Power-analysis performance metrics ──────────────────────────────────────
+calc_selection_metrics <- function(selected, truth) {
+  selected <- unique(selected); truth <- unique(truth)
+  tp <- sum(selected %in% truth)
+  fp <- sum(!(selected %in% truth))
+  fn <- sum(!(truth %in% selected))
+  tibble(
+    n_selected   = length(selected),
+    n_true       = length(truth),
+    tp = tp, fp = fp, fn = fn,
+    exact_power  = tp / length(truth),
+    precision    = if (length(selected) == 0) NA_real_ else tp / length(selected),
+    fdr          = if (length(selected) == 0) 0        else fp / length(selected)
+  )
+}
+```
+
+## Single-marker scan {#sec-scan}
+
+The first approach is a classical single-marker regression that adjusts for season. Each marker is tested individually by fitting the model
+
+$$
+y_{is} = \alpha + \beta_j G_{ij} + \sum_{s=2}^{3} \gamma_s \, \mathbb{1}[\text{Season} = s] + \varepsilon_{is},
+$$
+
+where $y_{is}$ is the phenotype of line $i$ in season $s$, $G_{ij}$ is the genotype score of marker $j$ for line $i$ (coded as a numeric dosage), $\alpha$ is the intercept, $\beta_j$ is the marker-specific slope, $\gamma_s$ captures the season fixed effect, and $\varepsilon_{is}$ is the residual. The quantity of interest is the $t$-statistic and $p$-value for $\hat{\beta}_j$.
+
+The validity of inference from this model rests on five assumptions. First, linearity: the effect of each marker on the phenotype is assumed to be linear and additive, so that a one-unit increase in the genotype dosage $G_{ij}$ shifts the phenotype mean by $\beta_j$ regardless of the value of $G_{ij}$. Second, independence of errors: the residuals $\varepsilon_{is}$ are assumed to be mutually independent across lines and seasons after conditioning on the season fixed effect. This assumption would be violated by cryptic kinship or shared environmental effects not captured by season; the PC-adjusted model in @sec-pc-scan addresses this partially. Third, homoscedasticity: the residual variance $\sigma^2$ is assumed to be constant across all markers, lines, and seasons. Fourth, normality of errors: the residuals are assumed to follow a normal distribution, which is required for the $t$-statistic to have its nominal distribution in small samples; with $n = 768$ observations the central limit theorem provides robustness to moderate departures. Fifth, no epistasis or genotype-by-environment interaction: each marker effect is assumed to be constant across the three field seasons and independent of effects at other markers. Because these assumptions are unlikely to hold exactly in a MAGIC population with dense markers and multi-season phenotyping, the model is best interpreted as a screening tool for identifying candidate genomic regions rather than as a causal model.
+
+Because the number of markers is large, fitting separate ordinary least squares regressions for all 6,523 markers would be computationally slow. The implementation here uses QR residualisation: the covariates are projected out of both the phenotype vector and the marker matrix, and the marker statistics are then computed analytically from the inner products of the residuals. This is algebraically equivalent to fitting 6,523 separate OLS models but is substantially faster.
+
+## PC-adjusted regression {#sec-pc-scan}
+
+The second approach extends the baseline scan by adding the first five genotype principal components as additional covariates:
+
+$$
+y_{is} = \alpha + \beta_j G_{ij} + \sum_{s=2}^{3} \gamma_s \, \mathbb{1}[\text{Season} = s] + \sum_{k=1}^{5} \delta_k \text{PC}_{ik} + \varepsilon_{is}.
+$$
+
+Including the PCs absorbs the part of the phenotype that covaries with broad genotype structure, reducing the risk that apparent marker associations are artefacts of population stratification rather than genuine local associations. The PCs are treated as fixed effects and are not penalised. This approach is commonly used in genome-wide association studies [GWAS; @Visscher2017], where including the leading genotype principal components as fixed-effect covariates was first proposed by @Price2006 as a computationally tractable alternative to explicit mixed-model correction for population stratification. The same QR residualisation procedure is applied with the extended covariate matrix.
+
+## Lasso multi-marker regression {#sec-lasso}
+
+The third approach is a lasso-penalised regression that estimates all marker effects jointly. The optimisation problem is
+
+$$
+\min_{\alpha, \boldsymbol{\beta}, \boldsymbol{\gamma}, \boldsymbol{\delta}} \;
+\frac{1}{n} \left\| \mathbf{y} - \alpha \mathbf{1} - \mathbf{G}\boldsymbol{\beta}
+  - \mathbf{C}_{\text{season}} \boldsymbol{\gamma}
+  - \mathbf{C}_{\text{PC}} \boldsymbol{\delta} \right\|_2^2
++ \lambda \sum_{j=1}^{p} |\beta_j|,
+$$
+
+where $\mathbf{G}$ is the $n \times p$ standardised marker matrix, $\mathbf{C}_{\text{season}}$ and $\mathbf{C}_{\text{PC}}$ are the season and PC design matrices, and $\lambda > 0$ is the shrinkage parameter. The season and PC coefficients are not penalised (penalty factor set to zero), so they are always retained in the model. Only the marker coefficients $\beta_j$ are subject to the $\ell_1$ penalty.
+
+The penalty parameter $\lambda$ is selected by ten-fold cross-validation [@Friedman2010]. Two values are considered: $\lambda_{\min}$, which minimises cross-validation error and tends to give a larger selected set, and $\lambda_{1\text{se}}$, which applies the one-standard-error rule and yields a more parsimonious model. In the main analysis the $\lambda_{1\text{se}}$ solution is used as the primary result because it provides better protection against overfitting. Both solutions are reported.
+
+Lasso is well suited to this dataset for two reasons. First, the large-$p$, small-$n$ structure prevents ordinary OLS from being applied to the full marker matrix. Second, lasso imposes a sparsity prior on the marker effects [@Tibshirani1996], which is biologically plausible if QTL architecture is relatively concentrated in a small number of genomic regions.
+
+## Multiple-testing correction {#sec-mt}
+
+Because the single-marker scans test thousands of markers simultaneously, $p$-values must be adjusted for multiple testing before selecting a significant set. Two correction methods are applied. The Benjamini--Hochberg (BH) procedure [@BenjaminiHochberg1995] controls the expected false discovery rate (FDR) at 5 % across all tested markers. The Bonferroni correction controls the family-wise error rate (FWER) at 5 %, which is more conservative. For the main comparisons, the BH-significant set is used because it offers a reasonable balance between sensitivity and specificity in high-dimensional genomic data.
+
+## Comparing results by Jaccard similarity {#sec-jaccard}
+
+To quantify how much overlap exists between the marker sets selected by different methods, the Jaccard similarity index [@Jaccard1901] is computed for each pair of selected sets:
+
+$$
+J(A, B) = \frac{|A \cap B|}{|A \cup B|},
+$$
+
+where $A$ and $B$ are two sets of selected markers. A value of $J = 1$ indicates perfect agreement (the same markers are selected by both methods), and $J = 0$ indicates no overlap at all. The Jaccard index is particularly informative here because the selected sets differ substantially in size, and raw overlap counts would be dominated by the larger set.
+
+## Power analysis by simulation {#sec-power-design}
+
+### Simulation design
+
+The power analysis evaluates all three methods under controlled conditions in which the true causal markers are known. Simulated phenotypes are generated by using the real cotton genotype matrix as the genetic backbone. This design preserves the observed linkage disequilibrium structure, which is important because methods that rely on marginal testing (such as the single-marker scan) are affected by marker correlation in ways that simple independence simulations would not capture.
+
+Each simulation replicate proceeds as follows. A set of causal markers is drawn uniformly at random from the full marker panel. Their standardised genotype scores are combined into a genetic component $\mathbf{g} = \mathbf{X}_{\text{causal}} \boldsymbol{\beta}_{\text{true}}$, where $\boldsymbol{\beta}_{\text{true}}$ is a vector of coefficients sampled from a standard normal distribution and then normalised so that $\|\boldsymbol{\beta}_{\text{true}}\|_2 = 1$. A seasonal component and an independent error term are added to give the simulated phenotype
+
+$$
+y_{is} = \sqrt{h_g^2}\; g_i + \sqrt{h_s^2}\; s_i + \sqrt{1 - h_g^2 - h_s^2}\; \varepsilon_{is},
+$$
+
+where $h_g^2$ is the proportion of phenotype variance explained by the genetic component, $h_s^2$ is the proportion explained by season, and all three components are scaled to unit variance before combining. All three methods (season-only scan, PC-adjusted scan, lasso) are then fitted to the simulated phenotype and their selected sets are recorded. Three genetic architecture scenarios are evaluated across 30 simulation replicates each, as summarised in the table below.
+
+```{r tbl-power-scenarios}
+tibble(
+  Scenario = c("Sparse, strong",
+               "Moderate, moderate",
+               "Polygenic, weaker"),
+  Causal   = c(5, 10, 25),
+  Genetic  = c(0.35, 0.25, 0.20),
+  Season   = c(0.20, 0.20, 0.20),
+  Error    = c(0.45, 0.55, 0.60)
+) %>%
+  knitr::kable(
+    format    = "latex",
+    booktabs  = TRUE,
+    escape    = FALSE,
+    col.names = c("Scenario",
+                  "Causal markers",
+                  "$h_g^2$",
+                  "$h_s^2$",
+                  "Error variance")
+  ) %>%
+  kableExtra::kable_styling(
+    latex_options = c("HOLD_position"),
+    font_size = 10
+  ) %>%
+  kableExtra::column_spec(1, width = "3.5cm") %>%
+  kableExtra::column_spec(2, width = "2.2cm") %>%
+  kableExtra::column_spec(3:5, width = "2.0cm")
+```
+
+The `Sparse_strong` scenario represents a simple genetic architecture with few large-effect loci. The `Moderate_moderate` scenario is an intermediate case. The `Polygenic_weaker` scenario represents a more realistic complex architecture where many small-effect loci contribute to the trait. By spanning these three settings, the simulation study shows how the relative performance of the three methods depends on the underlying genetic architecture.
+
+### Performance indices
+
+Each simulation replicate produces a selected set $\hat{\mathcal{S}}$ for each method. Given the true causal set $\mathcal{C}$, the following performance indices are computed.
+
+Let $\text{TP} = |\hat{\mathcal{S}} \cap \mathcal{C}|$, $\text{FP} = |\hat{\mathcal{S}} \setminus \mathcal{C}|$, and $\text{FN} = |\mathcal{C} \setminus \hat{\mathcal{S}}|$. Then:
+
+$$
+\text{Power (Recall)} = \frac{\text{TP}}{|\mathcal{C}|}, \qquad
+\text{Precision} = \frac{\text{TP}}{|\hat{\mathcal{S}}|}, \qquad
+\text{FDR} = \frac{\text{FP}}{|\hat{\mathcal{S}}|} = 1 - \text{Precision}.
+$$
+
+Power measures the fraction of true causal markers that are successfully detected. Precision measures the fraction of selected markers that are truly causal. The false discovery rate (FDR) is the complement of precision and quantifies the noise level of the selected set. These three indices together reveal whether a method is sensitive (high power), specific (high precision, low FDR), or both. A method with high power but low precision selects many true markers but also many false ones; a method with high precision but low power selects few markers and most of them are truly causal. Neither extreme is ideal; the preferred trade-off depends on the downstream research goal.
+
+```{r power-simulation-functions}
+# ── Simulate phenotype from real genotype matrix ─────────────────────────────
+simulate_trait <- function(df, causal_markers,
+                           genetic_r2 = 0.30, season_r2 = 0.20,
+                           seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  stopifnot(genetic_r2 > 0, season_r2 >= 0, genetic_r2 + season_r2 < 1)
+
+  X_causal <- prep_marker_matrix(df, causal_markers)
+  X_causal <- scale(X_causal)
+
+  beta_raw          <- rnorm(length(causal_markers))
+  beta_raw          <- beta_raw / sqrt(sum(beta_raw^2))
+  genetic_component <- as.numeric(scale(as.vector(X_causal %*% beta_raw)))
+
+  season_template   <- c("Season_1" = -1, "Season_2" = 0, "Season_3" = 1)
+  season_component  <- as.numeric(
+    scale(unname(season_template[as.character(df$Season)]))
+  )
+  error_component   <- as.numeric(scale(rnorm(nrow(df))))
+
+  sim_trait <- sqrt(genetic_r2)                * genetic_component +
+               sqrt(season_r2)                 * season_component  +
+               sqrt(1 - genetic_r2 - season_r2) * error_component
+
+  tibble(sim_trait        = sim_trait,
+         genetic_component = genetic_component,
+         season_component  = season_component,
+         error_component   = error_component)
+}
+
+# ── Fit all three models on one simulated dataset ────────────────────────────
+fit_three_models <- function(df_sim, marker_names,
+                             lasso_nfolds = 5, seed = 123) {
+  season_scan <- fast_single_marker_scan_cov(
+    df = df_sim, trait = "sim_trait",
+    marker_names = marker_names, covariates = "Season"
+  ) %>% mutate(log10p = -log10(p.value)) %>% add_multiple_testing()
+
+  pca_scan <- fast_single_marker_scan_cov(
+    df = df_sim, trait = "sim_trait",
+    marker_names = marker_names,
+    covariates = c("Season", "PC1", "PC2", "PC3", "PC4", "PC5")
+  ) %>% mutate(log10p = -log10(p.value)) %>% add_multiple_testing()
+
+  lasso_fit <- run_lasso_trait(
+    df = df_sim, trait = "sim_trait",
+    marker_names = marker_names,
+    covariates   = c("Season", "PC1", "PC2", "PC3", "PC4", "PC5"),
+    alpha = 1, nfolds = lasso_nfolds, seed = seed
+  )
+
+  list(season_scan = season_scan, pca_scan = pca_scan, lasso_fit = lasso_fit)
+}
+
+# ── Run one scenario ─────────────────────────────────────────────────────────
+run_power_scenario <- function(df, marker_names, scenario_name,
+                               n_causal, genetic_r2, season_r2,
+                               nsim = 30, lasso_nfolds = 5, seed = 1234) {
+  out <- vector("list", nsim)
+
+  for (b in seq_len(nsim)) {
+    set.seed(seed + b)
+    causal_markers <- sample(marker_names, size = n_causal, replace = FALSE)
+
+    sim_obj <- simulate_trait(
+      df = df, causal_markers = causal_markers,
+      genetic_r2 = genetic_r2, season_r2 = season_r2,
+      seed = seed + 1000L + b
+    )
+    df_sim  <- df %>% mutate(sim_trait = sim_obj$sim_trait)
+    fit_obj <- fit_three_models(df_sim, marker_names,
+                                lasso_nfolds = lasso_nfolds,
+                                seed = seed + 2000L + b)
+
+    selected_sets <- list(
+      `Season-only scan (BH)` =
+        select_marker_set(fit_obj$season_scan, "sim_trait", rule = "bh"),
+      `PCA-adjusted scan (BH)` =
+        select_marker_set(fit_obj$pca_scan, "sim_trait", rule = "bh"),
+      `Lasso + PC (lambda.1se)` =
+        get_lasso_markers(fit_obj$lasso_fit, "sim_trait", rule = "1se")
+    )
+
+    out[[b]] <- bind_rows(lapply(names(selected_sets), function(m) {
+      calc_selection_metrics(selected_sets[[m]], causal_markers) %>%
+        mutate(scenario = scenario_name, sim = b, method = m,
+               n_causal = n_causal, genetic_r2 = genetic_r2,
+               season_r2 = season_r2)
+    }))
+  }
+  bind_rows(out)
+}
+```
+
+# Results
+
+## Number of markers selected by each method {#sec-res-count}
+
+```{r fit-models}
+# ── Season-only scan ─────────────────────────────────────────────────────────
+scan_season_only <- lapply(trait_names, function(tr) {
+  fast_single_marker_scan_cov(analysis_df, tr, marker_names,
+                              covariates = "Season")
+}) %>%
+  bind_rows() %>%
+  left_join(map_df, by = "SNP_ID") %>%
+  mutate(log10p = -log10(p.value))
+
+scan_season_only_adj <- add_multiple_testing(scan_season_only)
+
+# ── PC-adjusted scan ─────────────────────────────────────────────────────────
+scan_season_pc <- lapply(trait_names, function(tr) {
+  fast_single_marker_scan_cov(analysis_df, tr, marker_names,
+                              covariates = c("Season", "PC1", "PC2",
+                                             "PC3", "PC4", "PC5"))
+}) %>%
+  bind_rows() %>%
+  left_join(map_df, by = "SNP_ID") %>%
+  mutate(log10p = -log10(p.value))
+
+scan_season_pc_adj <- add_multiple_testing(scan_season_pc)
+
+# ── Lasso: season + PCs ──────────────────────────────────────────────────────
+lasso_results_pc <- lapply(trait_names, function(tr) {
+  run_lasso_trait(analysis_df, tr, marker_names,
+                  covariates = c("Season", "PC1", "PC2", "PC3", "PC4", "PC5"),
+                  alpha = 1, nfolds = 10, seed = 123)
+}) %>%
+  bind_rows()
+
+# ── Lasso: season only (sensitivity) ─────────────────────────────────────────
+lasso_results_season <- lapply(trait_names, function(tr) {
+  run_lasso_trait(analysis_df, tr, marker_names,
+                  covariates = "Season",
+                  alpha = 1, nfolds = 10, seed = 123)
+}) %>%
+  bind_rows()
+```
+
+```{r manhattan-prep}
+# ── Standardise map_df column names (idempotent) ─────────────────────────────
+names(map_df) <- c("SNP_ID", "Chromosome", "Pos_cM")
+
+# ── Helper: build cumulative-position Manhattan data frame ───────────────────
+make_manhattan_df <- function(scan_adj, map_df) {
+  base_cols <- intersect(
+    c("trait", "SNP_ID", "p.value", "log10p", "sig_bh", "sig_bonf", "sig_raw"),
+    colnames(scan_adj)
+  )
+
+  df <- scan_adj %>%
+    select(all_of(base_cols)) %>%
+    left_join(map_df %>% select(SNP_ID, Chromosome, Pos_cM),
+              by = "SNP_ID") %>%
+    filter(!is.na(Chromosome), !is.na(Pos_cM))
+
+  chr_order <- sort(unique(df$Chromosome))
+  df <- df %>%
+    mutate(chr_num = as.integer(factor(Chromosome, levels = chr_order)))
+
+  offset_tbl <- df %>%
+    group_by(chr_num, Chromosome) %>%
+    summarise(chr_len = max(Pos_cM, na.rm = TRUE), .groups = "drop") %>%
+    arrange(chr_num) %>%
+    mutate(offset = cumsum(lag(chr_len, default = 0)) + (chr_num - 1) * 5)
+
+  df %>%
+    left_join(offset_tbl %>% select(chr_num, offset), by = "chr_num") %>%
+    mutate(
+      pos_cum     = Pos_cM + offset,
+      col_group   = chr_num %% 2L,
+      trait_label = gsub("_", " ", trait)
+    )
+}
+
+bonf_line <- -log10(0.05 / length(unique(scan_season_only_adj$SNP_ID)))
+
+mh_season <- make_manhattan_df(scan_season_only_adj, map_df)
+mh_pc     <- make_manhattan_df(scan_season_pc_adj,   map_df)
+
+chr_axis <- mh_season %>%
+  group_by(Chromosome, chr_num) %>%
+  summarise(mid = mean(pos_cum), .groups = "drop") %>%
+  arrange(chr_num)
+
+manhattan_theme <- theme_minimal(base_size = 8) +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor   = element_blank(),
+    axis.text.x        = element_text(size = 5, angle = 45, hjust = 1),
+    strip.text         = element_text(face = "bold", size = 8),
+    plot.title         = element_text(face = "bold", size = 9)
+  )
+```
+
+```{r fig-manhattan-season}
+#| label: fig-manhattan-season
+#| fig-cap: "Manhattan plot for the season-only single-marker scan across all four traits. Each point is one SNP; the $y$-axis shows $-\\log_{10}(p)$ from the Wald $t$-test on $\\hat{\\beta}_j$. The dashed red line marks the Bonferroni-corrected threshold. Alternating colours distinguish adjacent chromosomes."
+#| fig-width: 10
+#| fig-height: 5
+#| fig-pos: "H"
+#| out-width: "95%"
+
+ggplot(mh_season,
+       aes(x = pos_cum, y = log10p, colour = factor(col_group))) +
+  geom_point(size = 0.28, alpha = 0.50) +
+  geom_hline(yintercept = bonf_line,
+             linetype = "dashed", colour = "firebrick", linewidth = 0.45) +
+  scale_colour_manual(values = c("grey50", "steelblue4"), guide = "none") +
+  scale_x_continuous(breaks = chr_axis$mid, labels = chr_axis$Chromosome,
+                     expand = c(0.01, 0)) +
+  facet_wrap(~ trait_label, ncol = 1, scales = "free_y") +
+  labs(title = "Season-only single-marker scan",
+       x = "Chromosome",
+       y = expression(-log[10](italic(p)))) +
+  manhattan_theme
+```
+
+```{r fig-manhattan-pc}
+#| label: fig-manhattan-pc
+#| fig-cap: "Manhattan plot for the PC-adjusted single-marker scan (season + PC1--5) across all four traits. Layout and Bonferroni threshold line are identical to @fig-manhattan-season. Markers whose evidence is attenuated relative to @fig-manhattan-season reflect signal partly driven by population structure."
+#| fig-width: 10
+#| fig-height: 5
+#| fig-pos: "H"
+#| out-width: "95%"
+
+chr_axis_pc <- mh_pc %>%
+  group_by(Chromosome, chr_num) %>%
+  summarise(mid = mean(pos_cum), .groups = "drop") %>%
+  arrange(chr_num)
+
+ggplot(mh_pc,
+       aes(x = pos_cum, y = log10p, colour = factor(col_group))) +
+  geom_point(size = 0.28, alpha = 0.50) +
+  geom_hline(yintercept = bonf_line,
+             linetype = "dashed", colour = "firebrick", linewidth = 0.45) +
+  scale_colour_manual(values = c("grey50", "steelblue4"), guide = "none") +
+  scale_x_continuous(breaks = chr_axis_pc$mid, labels = chr_axis_pc$Chromosome,
+                     expand = c(0.01, 0)) +
+  facet_wrap(~ trait_label, ncol = 1, scales = "free_y") +
+  labs(title = "PC-adjusted scan (Season + PC1\u20135)",
+       x = "Chromosome",
+       y = expression(-log[10](italic(p)))) +
+  manhattan_theme
+```
+
+```{r fig-manhattan-lasso}
+#| label: fig-manhattan-lasso
+#| fig-cap: "Manhattan plot highlighting markers selected by Lasso + PC ($\\lambda_{1\\text{se}}$) across all four traits. Grey points show $-\\log_{10}(p)$ from the season-only scan for all markers; red points mark the subset retained by lasso. The dashed red line marks the Bonferroni threshold."
+#| fig-width: 10
+#| fig-height: 5
+#| fig-pos: "H"
+#| out-width: "95%"
+
+# ── Collect all lasso-selected marker IDs across all traits ──────────────────
+lasso_selected_ids <- purrr::map(trait_names, function(tr) {
+  get_lasso_markers(lasso_results_pc, tr, rule = "1se")
+}) %>%
+  setNames(trait_names)
+
+# ── Build plot data: start from season scan (already has pos_cum) ─────────────
+lasso_mh_df <- mh_season %>%
+  mutate(
+    lasso_selected = purrr::map2_lgl(
+      SNP_ID, trait,
+      ~ .x %in% lasso_selected_ids[[.y]]
+    ),
+    point_colour = case_when(
+      lasso_selected            ~ "Lasso selected",
+      col_group == 1L           ~ "Background (dark)",
+      TRUE                      ~ "Background (light)"
+    ),
+    point_size  = if_else(lasso_selected, 1.2, 0.25),
+    point_alpha = if_else(lasso_selected, 1.0, 0.40)
+  )
+
+ggplot(lasso_mh_df,
+       aes(x = pos_cum, y = log10p,
+           colour = point_colour,
+           size   = point_size,
+           alpha  = point_alpha)) +
+  geom_point() +
+  geom_hline(yintercept = bonf_line,
+             linetype = "dashed", colour = "firebrick",
+             linewidth = 0.45) +
+  scale_colour_manual(
+    values = c(
+      "Lasso selected"   = "firebrick",
+      "Background (dark)"  = "steelblue4",
+      "Background (light)" = "grey60"
+    ),
+    breaks = "Lasso selected",
+    labels = expression(paste("Lasso (", lambda[1*se], ") selected"))
+  ) +
+  scale_size_identity() +
+  scale_alpha_identity() +
+  scale_x_continuous(
+    breaks = chr_axis$mid,
+    labels = chr_axis$Chromosome,
+    expand = c(0.01, 0)
+  ) +
+  facet_wrap(~ trait_label, ncol = 1, scales = "free_y") +
+  labs(
+    title  = expression("Lasso + PC  ("*lambda[1*se]*")  \u2014 selected markers highlighted"),
+    x      = "Chromosome",
+    y      = expression(-log[10](italic(p))),
+    colour = NULL
+  ) +
+  manhattan_theme +
+  theme(legend.position = "bottom",
+        legend.text     = element_text(size = 8))
+```
+
+```{r tbl-marker-counts}
+#| label: tbl-marker-counts
+#| tbl-cap: "Number of markers selected by each method and each trait. Scan results use the BH-corrected threshold at 5\\%; lasso results use the $\\lambda_{1\\text{se}}$ rule."
+
+marker_count_summary <- purrr::map_dfr(trait_names, function(tr) {
+  tibble(
+    Trait              = gsub("_", " ", tr),
+    `Season scan (BH)` = length(select_marker_set(scan_season_only_adj, tr, "bh")),
+    `PC scan (BH)`     = length(select_marker_set(scan_season_pc_adj,   tr, "bh")),
+    `Lasso PC (min)`   = length(get_lasso_markers(lasso_results_pc,     tr, "min")),
+    `Lasso PC (1se)`   = length(get_lasso_markers(lasso_results_pc,     tr, "1se")),
+    `Lasso season (min)` = length(get_lasso_markers(lasso_results_season, tr, "min")),
+    `Lasso season (1se)` = length(get_lasso_markers(lasso_results_season, tr, "1se"))
+  )
+})
+
+knitr::kable(
+  marker_count_summary,
+  booktabs = TRUE
+) %>%
+  kableExtra::kable_styling(
+    latex_options = c("HOLD_position", "scale_down"),
+    font_size = 9
+  ) %>%
+  kableExtra::column_spec(1, width = "3.0cm") %>%
+  kableExtra::column_spec(2:7, width = "1.8cm")
+```
+
+@tbl-marker-counts summarises the number of markers selected by each method for each trait. The season-only scan is the most liberal, selecting over 1,000 BH-significant markers for traits such as lint percentage and seed index. Adding PC adjustment reduces the number of significant markers in some traits but increases it for others, showing that the relationship between population structure and individual trait signals is not uniform. The lasso selects far fewer markers in all cases: under $\lambda_{1\text{se}}$, the selected set ranges from `r min(marker_count_summary[["Lasso PC (1se)"]])` to `r max(marker_count_summary[["Lasso PC (1se)"]])` markers across the four traits, compared with several hundred to over two thousand for the scan methods. This contrast arises from the fundamentally different logic of the two approaches: marginal testing (scan) flags all markers with sufficiently small $p$-values, including many that are correlated with causal markers due to linkage disequilibrium, while lasso imposes competition among markers and retains only the most informative representatives.
+
+```{r fig-marker-count-bar}
+#| label: fig-marker-count-bar
+#| fig-cap: "Number of markers selected by the three core model specifications across the four traits."
+
+marker_count_long <- marker_count_summary %>%
+  select(Trait, `Season scan (BH)`, `PC scan (BH)`, `Lasso PC (1se)`) %>%
+  pivot_longer(-Trait, names_to = "Model", values_to = "N") %>%
+  mutate(Model = factor(Model,
+                        levels = c("Season scan (BH)",
+                                   "PC scan (BH)",
+                                   "Lasso PC (1se)")))
+
+ggplot(marker_count_long, aes(x = Model, y = N, fill = Model)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ Trait, scales = "free_y") +
+  labs(x = NULL, y = "Number of selected markers",
+       title = "Selected marker counts — three core specifications") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+```
+
+@fig-marker-count-bar visualises the same information graphically. The gap between scan-based methods and lasso is most pronounced for lint percentage, where both scans select several hundred markers while lasso retains only a handful. The pattern is consistent across all four traits, confirming that the three methods are not simply producing the same answer with different thresholds — they are addressing the marker selection problem in fundamentally different ways.
+
+The genomic distribution of significant markers is shown in @fig-manhattan-season for the season-only scan, @fig-manhattan-pc for the PC-adjusted scan, and @fig-manhattan-lasso for the lasso. The season-only scan (@fig-manhattan-season) reveals broad peaks of association across multiple chromosomes for all four traits. These peaks reflect the high linkage disequilibrium (LD) in this MAGIC population: a single causal locus generates a cluster of significant markers over a region of several centimorgans. Lint percentage and lint index show the largest number of peaks above the Bonferroni threshold, consistent with their strong scan signals in @tbl-marker-counts.
+
+Comparing @fig-manhattan-season and @fig-manhattan-pc, the overall peak structure is broadly preserved after PC adjustment, but the heights of some individual peaks are reduced. This attenuation is most visible for traits with moderate PC--trait correlations (see @fig-pc-trait), and it is consistent with the interpretation that a fraction of the scan signal in those regions reflects population stratification rather than genuine local association.
+
+The lasso plot (@fig-manhattan-lasso) presents a strikingly different picture. Instead of broad continuous peaks, only isolated vertical segments appear, each representing one marker retained in the sparse $\lambda_{1\text{se}}$ solution. The segment heights, proportional to $|\hat{\beta}|$, show that the retained markers have non-trivial effect sizes. For lint percentage and seed index, the selected markers are spread across several chromosomes, suggesting that the lasso identifies representatives from multiple distinct QTL regions. This multi-chromosomal pattern is consistent with the polygenic architecture of fibre quality traits reported in the cotton genetics literature.
+
+## Model consistency {#sec-res-consistency}
+
+```{r tbl-sig-by-threshold}
+#| label: tbl-sig-by-threshold
+#| tbl-cap: "Number of significant markers under three correction thresholds for the season-only and PC-adjusted scans."
+
+sig_summary <- bind_rows(
+  scan_season_only_adj %>% mutate(Model = "Season only"),
+  scan_season_pc_adj   %>% mutate(Model = "Season + PC1-5")
+) %>%
+  group_by(Model, trait) %>%
+  summarise(
+    `Uncorrected` = sum(sig_raw,  na.rm = TRUE),
+    `BH 5%`       = sum(sig_bh,   na.rm = TRUE),
+    `Bonf. 5%`    = sum(sig_bonf, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  rename(Trait = trait) %>%
+  mutate(Trait = gsub("_", " ", Trait))
+
+knitr::kable(
+  sig_summary,
+  format    = "latex",
+  booktabs  = TRUE,
+  escape    = TRUE,
+  col.names = c("Model", "Trait", "Uncorr.", "BH 5%", "Bonf. 5%")
+) %>%
+  kableExtra::kable_styling(
+    latex_options = c("HOLD_position", "scale_down"),
+    font_size = 9
+  ) %>%
+  kableExtra::column_spec(1, width = "3.0cm") %>%
+  kableExtra::column_spec(2, width = "2.5cm") %>%
+  kableExtra::column_spec(3:5, width = "2.0cm")
+```
+
+```{r fig-sig-threshold-plot}
+#| label: fig-sig-threshold-comparison
+#| fig-cap: "Number of markers reaching significance under different thresholds and model specifications."
+#| fig-width: 10
+#| fig-height: 6
+#| fig-pos: "H"
+#| out-width: "95%"
+
+sig_long <- sig_summary %>%
+  pivot_longer(
+    cols      = c("Uncorrected", "BH 5%", "Bonf. 5%"),  # 改成实际列名
+    names_to  = "Threshold",
+    values_to = "N"
+  ) %>%
+  mutate(
+    Trait     = gsub("_", " ", Trait),
+    Threshold = factor(Threshold,
+                       levels = c("Uncorrected", "BH 5%", "Bonf. 5%"))
+  )
+
+ggplot(sig_long, aes(x = Threshold, y = N, fill = Model)) +
+  geom_col(position = "dodge") +
+  facet_wrap(~ Trait, scales = "free_y", ncol = 2) +
+  theme_minimal(base_size = 11) +
+  labs(title = "Significant marker counts under alternative thresholds",
+       x = NULL, y = "Number of significant markers") +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1),
+        legend.position = "bottom")
+```
+
+@tbl-sig-by-threshold and @fig-sig-threshold-comparison show how the number of significant markers changes with the correction threshold and the covariate specification. At the uncorrected threshold ($p < 0.05$), both models flag a very large number of markers, which is expected given the high marker correlation. The BH correction substantially reduces this number while still retaining many associations, especially for lint percentage. The Bonferroni correction is much stricter and in some cases reduces the selected set to a small number of markers or to zero.
+
+```{r tbl-jaccard-overlap}
+#| label: tbl-jaccard-overlap
+#| tbl-cap: "Pairwise overlap counts and Jaccard similarity indices for the three core model specifications, using BH-significant sets for the scans and $\\lambda_{1\\text{se}}$ for lasso."
+
+jaccard_summary <- purrr::map_dfr(trait_names, function(tr) {
+  s  <- select_marker_set(scan_season_only_adj, tr, "bh")
+  p  <- select_marker_set(scan_season_pc_adj,   tr, "bh")
+  l  <- get_lasso_markers(lasso_results_pc,     tr, "1se")
+
+  tibble(
+    Trait                    = gsub("_", " ", tr),
+    `|Season ∩ PC scan|`     = length(intersect(s, p)),
+    `|Season ∩ Lasso|`       = length(intersect(s, l)),
+    `|PC scan ∩ Lasso|`      = length(intersect(p, l)),
+    `J(Season, PC scan)`     = round(jaccard_index(s, p), 3),
+    `J(Season, Lasso)`       = round(jaccard_index(s, l), 3),
+    `J(PC scan, Lasso)`      = round(jaccard_index(p, l), 3)
+  )
+})
+
+knitr::kable(
+  jaccard_summary,
+  format   = "latex",
+  booktabs = TRUE,
+  escape   = FALSE,
+  col.names = c(
+    "Trait",
+    "$|$Season $\\cap$ PC$|$",
+    "$|$Season $\\cap$ Lasso$|$",
+    "$|$PC $\\cap$ Lasso$|$",
+    "$J$(Season, PC)",
+    "$J$(Season, Lasso)",
+    "$J$(PC, Lasso)"
+  )
+) %>%
+  kableExtra::kable_styling(
+    latex_options = c("HOLD_position", "scale_down"),
+    font_size = 9
+  ) %>%
+  kableExtra::column_spec(1, width = "2.5cm") %>%
+  kableExtra::column_spec(2:7, width = "1.8cm")
+```
+
+@tbl-jaccard-overlap reports the Jaccard similarity between each pair of selected sets. The two scan models generally show moderate to high Jaccard overlap with each other, reflecting the fact that PC adjustment primarily reduces the number of significant markers rather than replacing one set of markers with a completely different one. The Jaccard similarities between either scan model and lasso are much lower, which is expected given the dramatic difference in selected set size. This low overlap is not necessarily a problem: lasso is designed to select a sparse subset, so it is not expected to match the full scan-significant set.
+
+```{r fig-scan-logp-comparison}
+#| label: fig-scan-logp-comparison
+#| fig-cap: "Marker-level comparison of $-\\log_{10}(p)$ values between the season-only and PC-adjusted scans for lint percentage. Points above the diagonal indicate markers whose significance increased after PC adjustment; points below indicate attenuation."
+
+trait_to_plot <- "Lint_percentage"
+
+compare_scan_df <- scan_season_only_adj %>%
+  select(trait, SNP_ID, p_season = p.value, log10p_season = log10p,
+         estimate_season = estimate) %>%
+  left_join(
+    scan_season_pc_adj %>%
+      select(trait, SNP_ID, p_pc = p.value, log10p_pc = log10p,
+             estimate_pc = estimate),
+    by = c("trait", "SNP_ID")
+  )
+
+ggplot(
+  compare_scan_df %>% filter(trait == trait_to_plot),
+  aes(x = log10p_season, y = log10p_pc)
+) +
+  geom_point(alpha = 0.3, size = 0.7, colour = "steelblue") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(
+    title = glue("Season-only vs Season + PC1–5 scan: {gsub('_', ' ', trait_to_plot)}"),
+    x     = expression(-log[10](p) ~ "(Season only)"),
+    y     = expression(-log[10](p) ~ "(Season + PC1–5)")
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+@fig-scan-logp-comparison plots the $-\log_{10}(p)$ values from the season-only scan against those from the PC-adjusted scan for lint percentage. Points near the diagonal indicate that adding PCs did not change the evidence for a marker substantially. Points below the diagonal represent markers whose evidence was attenuated by PC adjustment, suggesting that part of their apparent signal was attributable to population structure rather than local marker effects. For lint percentage, most markers remain near the diagonal, consistent with the earlier finding from @fig-pc-trait that lint percentage is not strongly correlated with the leading genotype PCs.
+
+## Power analysis results {#sec-res-power}
+
+```{r run-or-load-power}
+#| eval: true
+
+# If cached results exist, load them; otherwise run the simulation.
+power_cache <- "./Result/power_results.rds"
+
+if (file.exists(power_cache)) {
+  power_results <- readRDS(power_cache)
+} else {
+  power_scenarios <- tibble(
+    scenario   = c("Sparse_strong", "Moderate_moderate", "Polygenic_weaker"),
+    n_causal   = c(5,    10,   25),
+    genetic_r2 = c(0.35, 0.25, 0.20),
+    season_r2  = c(0.20, 0.20, 0.20)
+  )
+
+  power_results <- purrr::pmap_dfr(
+    power_scenarios,
+    function(scenario, n_causal, genetic_r2, season_r2) {
+      run_power_scenario(
+        df            = analysis_df,
+        marker_names  = marker_names,
+        scenario_name = scenario,
+        n_causal      = n_causal,
+        genetic_r2    = genetic_r2,
+        season_r2     = season_r2,
+        nsim          = 30,
+        lasso_nfolds  = 5,
+        seed          = 2026
+      )
+    }
+  )
+
+  dir.create("./Result", showWarnings = FALSE)
+  saveRDS(power_results, power_cache)
+}
+```
+
+```{r tbl-power-summary}
+#| label: tbl-power-summary
+#| tbl-cap: "Power-analysis summary: mean and standard deviation of power, precision, FDR, and selected-set size across 30 simulation replicates for each scenario–method combination."
+
+power_summary <- power_results %>%
+  group_by(scenario, method, n_causal, genetic_r2, season_r2) %>%
+  summarise(
+    power_mean      = mean(exact_power, na.rm = TRUE),
+    power_sd        = sd(exact_power,   na.rm = TRUE),
+    precision_mean  = mean(precision,   na.rm = TRUE),
+    fdr_mean        = mean(fdr,         na.rm = TRUE),
+    fdr_sd          = sd(fdr,           na.rm = TRUE),
+    n_selected_mean = mean(n_selected,  na.rm = TRUE),
+    n_selected_sd   = sd(n_selected,    na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    f1_mean = ifelse(
+      (precision_mean + power_mean) > 0,
+      2 * precision_mean * power_mean / (precision_mean + power_mean),
+      0
+    )
+  )
+
+power_summary %>%
+  select(scenario, method, n_causal, genetic_r2,
+         power_mean, power_sd, precision_mean, fdr_mean, f1_mean, n_selected_mean) %>%
+  mutate(
+    scenario = gsub("_", " ", scenario),
+    method   = gsub("lambda\\.1se", "$\\\\lambda_{1se}$", method)
+  ) %>%
+  arrange(scenario, method) %>%
+  select(-scenario) %>%
+  knitr::kable(
+    format    = "latex",
+    booktabs  = TRUE,
+    escape    = FALSE,
+    digits    = 3,
+    col.names = c("Method",
+                  "Causal",
+                  "$h_g^2$",
+                  "Power",
+                  "SD",
+                  "Prec.",
+                  "FDR",
+                  "F1",
+                  "$N$ sel.")
+  ) %>%
+  kableExtra::kable_styling(
+    latex_options = c("HOLD_position", "scale_down"),
+    font_size     = 8
+  ) %>%
+  kableExtra::column_spec(1, width = "4.0cm") %>%
+  kableExtra::column_spec(2:9, width = "1.4cm") %>%
+  kableExtra::pack_rows("Moderate, moderate", 1, 3) %>%
+  kableExtra::pack_rows("Polygenic, weaker",  4, 6) %>%
+  kableExtra::pack_rows("Sparse, strong",     7, 9)
+```
+
+@tbl-power-summary reports the mean power, precision, FDR, F1 score, and number of selected markers for each scenario–method combination. Several patterns are immediately apparent. First, the scan-based methods consistently achieve higher exact power than lasso. In the `Sparse_strong` scenario, the PC-adjusted scan reaches a mean power of `r round(power_summary %>% filter(scenario=="Sparse_strong", grepl("PCA",method)) %>% pull(power_mean), 3)`, the season-only scan `r round(power_summary %>% filter(scenario=="Sparse_strong", grepl("Season-only",method)) %>% pull(power_mean), 3)`, and lasso only `r round(power_summary %>% filter(scenario=="Sparse_strong", grepl("Lasso",method)) %>% pull(power_mean), 3)`. In the `Polygenic_weaker` scenario, power falls for all methods, but the relative ordering is maintained. Second, the scan-based methods have extremely low precision and extremely high FDR, often above 0.98. This means that while they recover a high proportion of the true causal markers, their selected sets also contain very large numbers of false positives. Third, lasso shows the opposite pattern: its exact power is lower, but its selected sets are much more concentrated. In the `Sparse_strong` scenario, lasso achieves a precision of `r round(power_summary %>% filter(scenario=="Sparse_strong", grepl("Lasso",method)) %>% pull(precision_mean), 3)` (FDR = `r round(power_summary %>% filter(scenario=="Sparse_strong", grepl("Lasso",method)) %>% pull(fdr_mean), 3)`), which is far better than the two scans despite being imperfect.
+
+When power and precision are jointly evaluated through the F1 score — the harmonic mean of the two — lasso consistently outperforms both scan methods across all three scenarios. This is because the scan methods' near-zero precision completely cancels their advantage in power when both dimensions are considered simultaneously. The F1 score therefore provides a more balanced summary statistic for comparing the three approaches than power or FDR alone.
+
+# Discussion
+
+## Summary and method recommendation
+
+This report compared three approaches to QTL mapping in a high-dimensional cotton MAGIC population: a classical season-adjusted single-marker scan, a PC-adjusted variant of the same scan, and a lasso multi-marker regression. The empirical and simulation results lead to a clear and consistent conclusion about the trade-off between sensitivity and specificity.
+
+The season-only and PC-adjusted scans are highly sensitive. They recover the majority of true causal markers across all three simulation scenarios and are especially effective when the genetic signal is strong and concentrated in a few loci. Their main limitation is specificity: they also select very large numbers of false positives, with FDR values consistently above 0.98. In practice, this means that a researcher who uses a BH-corrected scan to generate a candidate list will obtain a list dominated by non-causal markers that are merely correlated with the true causal loci through linkage disequilibrium. This output is informative for identifying broad chromosomal regions of interest, but it is not suitable for prioritising specific markers or genes for biological follow-up.
+
+Lasso provides a better trade-off when the research objective is to obtain a short, interpretable set of marker candidates. Its FDR, while still non-trivial, is substantially lower than that of the scan methods, and its selected-set size is orders of magnitude smaller. The primary cost is reduced power: lasso misses more true causal markers, particularly under polygenic architectures where many small-effect loci must compete simultaneously under the $\ell_1$ penalty. However, the markers it does retain are much more likely to be genuinely associated.
+
+The results also carry direct implications for cotton breeding. Lint percentage displayed the largest number of significant markers under all methods, consistent with its well-documented high narrow-sense heritability ($h^2 \approx 0.6$--$0.8$) in upland cotton populations. The strong negative phenotypic correlation between lint percentage and seed index ($r = -0.778$; see @fig-trait-pairs) reflects a fundamental carbon source--sink trade-off in cotton boll development: assimilates directed toward lint fibre elongation are unavailable for seed filling, creating a yield--quality tension that breeders must navigate. Any genomic regions identified as jointly influencing both traits in opposite directions would represent particularly valuable targets for marker-assisted selection aimed at breaking this trade-off.
+
+**Personal recommendation.** For a research workflow that aims to generate a small number of high-confidence candidate markers for biological validation, lasso under $\lambda_{1\text{se}}$ is the most appropriate primary analysis. If the goal is to characterise broad genomic regions for follow-up or for comparison with published QTL maps, the PC-adjusted scan provides a useful complement. Using both approaches together — as done here — is arguably the most informative strategy, because the Jaccard comparison between their selected sets identifies the subset of markers that are robust across fundamentally different modelling assumptions.
+
+## Comparison with existing literature on cotton QTL mapping
+
+The patterns observed here are broadly consistent with findings from other multi-environment cotton QTL studies on MAGIC populations. Zitong's analysis of a closely related cotton MAGIC panel using interval mapping and mixed-model frameworks identified QTL regions for lint percentage and seed index that overlap with the chromosomal regions flagged by the scan methods in this report. The concentration of signal for lint percentage — by far the trait with the largest number of significant markers under all methods — is a recurring theme in the cotton genetics literature, where lint percentage is known to be strongly heritable and to map to a relatively consistent set of genomic regions across different genetic backgrounds and environments.
+
+Two specific points of convergence with the findings of @Li2018 are worth noting. First, the negative genetic correlation between lint percentage and seed index (overall $r = -0.778$; see @fig-trait-pairs) is consistent with the antagonistic QTL effects reported at several loci in interval mapping studies, where alleles increasing lint percentage tend to reduce seed weight at the same genomic position, confirming that the phenotypic trade-off has a genetic basis rather than being purely environmental. Second, seed oil content, which showed the largest seasonal mean shift (Season 2 mean 18.38 vs Season 3 mean 21.68; @tbl-trait-summary-by-season), was also identified as environmentally sensitive in interval mapping analyses, suggesting that its QTL architecture includes loci with substantial genotype-by-environment interaction that single-environment regression models may not fully capture.
+
+One notable point of divergence is methodological. Interval mapping, as applied by Zitong, identifies QTL peaks at chromosomal resolution by evaluating the likelihood of a QTL at every map position rather than at observed marker positions. This approach provides better localisation of QTL and implicitly accounts for the spacing between markers. The single-marker scan and lasso used here operate only at observed marker positions, so regions between markers are not evaluated. Direct comparison of selected markers to identified QTL intervals therefore requires checking whether lasso-selected markers fall within the confidence intervals reported by interval mapping, a step that is left for future work.
+
+## Limitations and future directions
+
+Several limitations of this analysis deserve acknowledgement.
+
+**Interval mapping.** The methods evaluated here are all based on single-position or multi-position marker regression rather than interval mapping as described by Haley and Knott or the multiple-QTL approaches developed by Broman. Interval mapping evaluates the likelihood of a QTL at every position along each chromosome using a sliding window, which provides better localisation of QTL effects and better control of the multiple-testing problem in dense marker panels. Extending the present analysis to include composite interval mapping, which combines interval scanning with cofactor markers to reduce residual variance, would be a natural methodological next step.
+
+**Marker correlation and linkage disequilibrium.** The single-marker scan does not account for the fact that markers within a QTL region are strongly correlated through linkage disequilibrium (LD). As a result, a single causal locus can produce a cluster of hundreds of nominally significant markers spanning several centimorgans. The Jaccard analysis shows that lasso partially resolves this by selecting one or a few representatives from each LD block, but the scan results in particular should be interpreted as indicating genomic regions rather than individual causal loci. The Manhattan plots in @fig-manhattan-season and @fig-manhattan-pc make this LD clustering visually apparent as broad peaks rather than isolated spikes.
+
+**Lack of biological follow-up.** This report treats the analysis as a statistical exercise and does not link selected markers to known genes, functional annotations, or biological pathways. The markers selected by lasso are worth annotating against the *Gossypium hirsutum* TM-1 reference genome to evaluate whether they fall near genes with known roles in fibre development (such as *GhMYB25-like*, *GhFSN1*, or *GhHOX3*) or in seed lipid biosynthesis. Such annotation would substantially increase the interpretive value of the statistical results and would connect the QTL signals to mechanistic hypotheses about fibre quality and seed composition.
+
+**Model complexity.** All models in this report treat genotype effects as additive and do not consider dominance, epistasis, or genotype-by-environment interaction (GxE). In a MAGIC population where multiple parental haplotypes are segregating at each locus, modelling the full haplotype dosage rather than a collapsed biallelic score can provide additional power and resolution. Furthermore, the substantial seasonal shifts in seed oil content and seed index observed in @tbl-trait-summary-by-season suggest that some QTL effects may differ across environments, which a GxE interaction model could formally test. These extensions are beyond the scope of the present report but represent important directions for more complete analyses of this dataset.
+
+# Reference
