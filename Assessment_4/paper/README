@@ -1,0 +1,16 @@
+## Project Structure
+- `paper/` — Quarto source files for the paper
+- `R-shiny-app-final-vesrion/` — R Shiny app source code
+
+## Data
+Data is publicly available at CSIRO Data Access Portal:
+https://doi.org/10.25919/k18n-nk98
+
+## How to Reproduce
+1. Download data from the link above
+2. Place data files in `paper/data/`
+3. Open `paper/QTL_Analysis.qmd` in RStudio
+4. Run `quarto render QTL_Analysis.qmd`
+
+## Required R Packages
+glmnet, irlba, lme4breeding, gtsummary, kableExtra, tidyverse
